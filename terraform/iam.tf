@@ -1,6 +1,6 @@
 # IAM role for Webhook Lambda
 resource "aws_iam_role" "webhook_lambda" {
-  name = "media-downloader-webhook-role"
+  name = "media-downloader-webhook-role-v2"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -51,6 +51,11 @@ resource "aws_iam_role_policy" "webhook_lambda" {
           "${aws_dynamodb_table.files.arn}/index/*",
           "${aws_dynamodb_table.active_downloads.arn}"
         ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = "kms:Decrypt"
+        Resource = "*"
       }
     ]
   })
@@ -58,7 +63,7 @@ resource "aws_iam_role_policy" "webhook_lambda" {
 
 # IAM role for Processor Lambda
 resource "aws_iam_role" "processor_lambda" {
-  name = "media-downloader-processor-role"
+  name = "media-downloader-processor-role-v2"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -135,6 +140,11 @@ resource "aws_iam_role_policy" "processor_lambda" {
           "${aws_dynamodb_table.files.arn}/index/*",
           "${aws_dynamodb_table.active_downloads.arn}"
         ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = "kms:Decrypt"
+        Resource = "*"
       }
     ]
   })

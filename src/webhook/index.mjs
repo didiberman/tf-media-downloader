@@ -23,6 +23,7 @@ const patterns = {
 
 async function sendTelegramMessage(chatId, text) {
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  console.log(`Sending Telegram message to ${chatId}: ${text.substring(0, 50)}...`);
   try {
     const response = await fetch(url, {
       method: 'POST',
@@ -34,7 +35,9 @@ async function sendTelegramMessage(chatId, text) {
         disable_web_page_preview: true,
       }),
     });
-    return response.json();
+    const result = await response.json();
+    console.log(`Telegram response for ${chatId}:`, JSON.stringify(result));
+    return result;
   } catch (error) {
     console.error('Failed to send Telegram message:', error);
   }
@@ -378,12 +381,18 @@ export async function handler(event) {
     }
 
     // AUTH CHECK
+    console.log(`Checking auth for user: ${username}`);
     const isAllowed = await checkAuth(username);
+    console.log(`User ${username} isAllowed: ${isAllowed}`);
 
     // Handle Admin Commands if sender is admin
     if (username === TELEGRAM_ADMIN_USERNAME && text.startsWith('/')) {
+      console.log(`Handling admin command: ${text}`);
       const handled = await handleAdminCommands(chatId, text, username);
-      if (handled) return { statusCode: 200, body: 'OK' };
+      if (handled) {
+        console.log('Admin command handled');
+        return { statusCode: 200, body: 'OK' };
+      }
     }
 
     if (!isAllowed) {
@@ -416,6 +425,7 @@ export async function handler(event) {
 
     // Detect source type
     const sourceType = detectSource(url);
+    console.log(`Detected source type: ${sourceType} for URL: ${url}`);
     if (!sourceType) {
       await sendTelegramMessage(
         chatId,
@@ -426,9 +436,11 @@ export async function handler(event) {
 
     // Generate unique download ID for tracking
     const downloadId = randomUUID();
+    console.log(`Generated downloadId: ${downloadId}`);
 
     // Create active download record
     if (DYNAMODB_ACTIVE_DOWNLOADS_TABLE) {
+      console.log(`Creating active download record in ${DYNAMODB_ACTIVE_DOWNLOADS_TABLE}`);
       try {
         const ttlSeconds = Math.floor(Date.now() / 1000) + (15 * 60); // 15 min TTL
         await ddb.send(new PutItemCommand({
@@ -444,6 +456,7 @@ export async function handler(event) {
             ttl: { N: String(ttlSeconds) }
           }
         }));
+        console.log('Active download record created successfully');
       } catch (error) {
         console.error('Failed to create active download record:', error);
       }
@@ -458,7 +471,7 @@ export async function handler(event) {
     };
 
     const outputType = sourceType === 'youtube-long' ? 'MP3' : 'MP4';
-
+    console.log('Sending processing message...');
     const processingMsg = await sendTelegramMessage(
       chatId,
       `${sourceEmoji[sourceType]} Processing your ${sourceType.replace('-', ' ')}...\n\n` +
@@ -466,8 +479,10 @@ export async function handler(event) {
     );
 
     const progressMessageId = processingMsg?.result?.message_id;
+    console.log(`Processing message sent, ID: ${progressMessageId}`);
 
     // Queue the download request with progress message ID
+    console.log('Queuing message to SQS...');
     await sqs.send(
       new SendMessageCommand({
         QueueUrl: SQS_QUEUE_URL,
@@ -482,6 +497,7 @@ export async function handler(event) {
         }),
       })
     );
+    console.log('Message queued successfully');
 
     return { statusCode: 200, body: 'OK' };
   } catch (error) {

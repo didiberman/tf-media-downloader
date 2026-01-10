@@ -16,8 +16,13 @@ A serverless Telegram bot that downloads media from Instagram and YouTube, store
 ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
 │   S3 Bucket     │◀─────│ Processor Lambda│◀─────│  DynamoDB x3    │
 │ (7-day Lifecycle│      │ (yt-dlp + Send) │      │ (Users + Files  │
-└─────────────────┘      └─────────────────┘      │  + Active DLs)  │
-                                                  └─────────────────┘
+└─────────────────┘      └────────┬────────┘      │  + Active DLs)  │
+                                  │               └─────────────────┘
+                                  ▼
+                         ┌─────────────────┐
+                         │ Telegram Message│
+                         │ (Live Updates)  │
+                         └─────────────────┘
 ```
 
 ---
@@ -169,8 +174,9 @@ cd layers/yt-dlp
 
 Active downloads show live progress updates:
 
-1. **In Telegram**: The "Processing..." message updates every 5 seconds with current download percentage and speed
+1. **In Telegram**: The "Processing..." message updates every **2 seconds** with current download percentage and speed
 2. **In `/list`**: Shows active downloads with percentage, speed, user, and elapsed time
+3. **File Size Inclusion**: All completion messages include the final file size (e.g., `(25.4 MB)`) next to the title.
 
 **Phases shown:**
 - 📥 Starting download...
