@@ -348,6 +348,22 @@ function extractUrl(text) {
   return urlMatch ? urlMatch[0] : null;
 }
 
+async function answerCallbackQuery(callbackQueryId, text = null) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/answerCallbackQuery`;
+  try {
+    const payload = { callback_query_id: callbackQueryId };
+    if (text) payload.text = text;
+
+    await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch (error) {
+    console.error('Failed to answer callback query:', error);
+  }
+}
+
 export async function handler(event) {
   console.log('Received event:', JSON.stringify(event, null, 2));
 
@@ -366,6 +382,52 @@ export async function handler(event) {
       bodyText = Buffer.from(bodyText, 'base64').toString('utf8');
     }
     const body = JSON.parse(bodyText);
+
+    // Handle callback queries (button presses)
+    if (body.callback_query) {
+      const callbackQuery = body.callback_query;
+      const callbackData = callbackQuery.data;
+      const chatId = callbackQuery.message.chat.id;
+      const username = callbackQuery.from?.username;
+
+      console.log(`Callback query from @${username}: ${callbackData}`);
+
+      // Check auth
+      const isAllowed = await checkAuth(username);
+      if (!isAllowed) {
+        await answerCallbackQuery(callbackQuery.id, '🚫 Access denied');
+        return { statusCode: 200, body: 'OK' };
+      }
+
+      // Handle "analyze:fileKey" callback
+      if (callbackData.startsWith('analyze:')) {
+        const fileKey = callbackData.replace('analyze:', '');
+
+        // Answer the callback query immediately
+        await answerCallbackQuery(callbackQuery.id, '🧠 Starting analysis...');
+
+        // Edit the message to show analysis is starting
+        await sendTelegramMessage(chatId, '🧠 <b>Video Analysis Starting...</b>\n\n<i>This will take ~2-3 minutes. I\'ll analyze the video\'s hook, retention mechanics, and virality strategy.</i>');
+
+        // Queue analysis job to SQS
+        await sqs.send(
+          new SendMessageCommand({
+            QueueUrl: SQS_QUEUE_URL,
+            MessageBody: JSON.stringify({
+              action: 'analyze',
+              chatId,
+              fileKey,
+              username,
+            }),
+          })
+        );
+
+        return { statusCode: 200, body: 'OK' };
+      }
+
+      return { statusCode: 200, body: 'OK' };
+    }
+
     const message = body.message;
 
     if (!message?.text || !message?.chat?.id) {

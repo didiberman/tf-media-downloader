@@ -6,6 +6,7 @@ import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-sec
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { DynamoDBClient, UpdateItemCommand, PutItemCommand, GetItemCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
 import { randomUUID } from 'crypto';
+import { analyzeVideo } from './videoAnalysis.mjs';
 
 const s3 = new S3Client({});
 const secrets = new SecretsManagerClient({});
@@ -55,34 +56,54 @@ async function getCookiesForSource(sourceType) {
     return null;
 }
 
-async function sendTelegramMessage(chatId, text) {
+async function sendTelegramMessage(chatId, text, replyMarkup = null) {
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+    const payload = {
+        chat_id: chatId,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+    };
+
+    if (replyMarkup) {
+        payload.reply_markup = replyMarkup;
+    }
+
     const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body: JSON.stringify(payload),
+    });
+    const result = await response.json();
+
+    if (!result.ok) {
+        console.error('sendTelegramMessage failed:', JSON.stringify(result));
+    } else {
+        console.log('sendTelegramMessage succeeded:', JSON.stringify(result));
+    }
+
+    return result;
+}
+
+async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
+    try {
+        const payload = {
             chat_id: chatId,
+            message_id: messageId,
             text,
             parse_mode: 'HTML',
             disable_web_page_preview: true,
-        }),
-    });
-    return response.json();
-}
+        };
 
-async function editTelegramMessage(chatId, messageId, text) {
-    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
-    try {
+        if (replyMarkup) {
+            payload.reply_markup = replyMarkup;
+        }
+
         const response = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: chatId,
-                message_id: messageId,
-                text,
-                parse_mode: 'HTML',
-                disable_web_page_preview: true,
-            }),
+            body: JSON.stringify(payload),
         });
         const result = await response.json();
         if (!response.ok || !result.ok) {
@@ -557,11 +578,93 @@ async function trackFile(key, sourceType, title, sizeMB, url, username) {
     }
 }
 
+async function handleAnalysisRequest(chatId, fileKey, username) {
+    try {
+        // Download file from S3 to /tmp
+        const videoPath = `/tmp/${Date.now()}_video.mp4`;
+        const videoStream = await s3.send(new GetObjectCommand({
+            Bucket: S3_BUCKET_NAME,
+            Key: fileKey
+        }));
+
+        // Write stream to file
+        const fileStream = require('fs').createWriteStream(videoPath);
+        await require('stream/promises').pipeline(videoStream.Body, fileStream);
+
+        // Extract title from fileKey
+        const filename = fileKey.split('/').pop();
+        const title = filename.replace(/\.[^/.]+$/, '');
+
+        // Run analysis
+        const analysis = await analyzeVideo(videoPath, title);
+
+        // Cleanup
+        if (existsSync(videoPath)) unlinkSync(videoPath);
+
+        // Send analysis to user (split if too long for Telegram)
+        await sendAnalysisToTelegram(chatId, analysis, title);
+
+    } catch (error) {
+        console.error('Analysis error:', error);
+        await sendTelegramMessage(chatId, `❌ <b>Analysis Failed</b>\n\n<i>Error: ${error.message}</i>`);
+    }
+}
+
+async function sendAnalysisToTelegram(chatId, analysis, title) {
+    const header = `🎬 <b>Video Analysis: ${title}</b>\n\n`;
+    const fullMessage = header + analysis;
+
+    // Telegram has a 4096 char limit per message
+    if (fullMessage.length <= 4096) {
+        await sendTelegramMessage(chatId, fullMessage);
+    } else {
+        // Split into multiple messages
+        await sendTelegramMessage(chatId, header + '(Analysis split into multiple messages due to length)\n\n');
+
+        const chunks = splitMessage(analysis, 3900);
+        for (let i = 0; i < chunks.length; i++) {
+            await sendTelegramMessage(chatId, `<i>Part ${i + 1}/${chunks.length}</i>\n\n${chunks[i]}`);
+            // Small delay to ensure order
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+    }
+}
+
+function splitMessage(text, maxLength) {
+    const chunks = [];
+    let currentChunk = '';
+
+    const paragraphs = text.split('\n\n');
+
+    for (const para of paragraphs) {
+        if ((currentChunk + para).length > maxLength) {
+            if (currentChunk) chunks.push(currentChunk.trim());
+            currentChunk = para + '\n\n';
+        } else {
+            currentChunk += para + '\n\n';
+        }
+    }
+
+    if (currentChunk) chunks.push(currentChunk.trim());
+
+    return chunks;
+}
+
 export async function handler(event) {
     console.log('Processing event:', JSON.stringify(event, null, 2));
 
     for (const record of event.Records) {
-        const { chatId, url, sourceType, username, downloadId, progressMessageId } = JSON.parse(record.body);
+        const messageBody = JSON.parse(record.body);
+
+        // Check if this is an analysis request
+        if (messageBody.action === 'analyze') {
+            const { chatId, fileKey, username } = messageBody;
+            await handleAnalysisRequest(chatId, fileKey, username);
+            continue;
+        }
+
+        // Otherwise, it's a download request
+        const { chatId, url, sourceType, username, downloadId, progressMessageId } = messageBody;
         let filePath = null;
 
         try {
@@ -597,28 +700,52 @@ export async function handler(event) {
                 `<a href="${s3Url}">📥 Direct S3 Link</a>\n\n` +
                 `<i>Link expires in 7 days</i>`;
 
+            // Create inline button for video analysis
+            // Only add button for short-form videos (< 90 seconds)
+            const analyzeButton = {
+                inline_keyboard: [[
+                    {
+                        text: "🧠 Analyze Video",
+                        callback_data: `analyze:${s3Key}`
+                    }
+                ]]
+            };
+
             // Try to upload directly to Telegram
             const uploadSuccess = await uploadToTelegram(chatId, filePath, caption);
+
+            console.log(`Upload success: ${uploadSuccess}, progressMessageId: ${progressMessageId}`);
+            console.log(`About to check button logic...`);
 
             // If upload succeeded, we can delete the progress message (file itself has caption)
             // If upload failed or was skipped, edit the progress message with the result
             if (uploadSuccess && progressMessageId) {
+                console.log(`Entering uploadSuccess && progressMessageId block`);
+
                 // Delete the "Processing..." message since we sent the file with caption
                 try {
+                    console.log(`About to delete progress message ${progressMessageId}...`);
                     await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteMessage`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ chat_id: chatId, message_id: progressMessageId })
                     });
+                    console.log(`Progress message deleted successfully`);
                 } catch (e) {
                     console.error('Failed to delete progress message:', e.message);
                 }
+
+                // Send analysis button as separate message
+                console.log(`About to send button message...`);
+                console.log(`analyzeButton:`, JSON.stringify(analyzeButton));
+                await sendTelegramMessage(chatId, `Want insights on this video?`, analyzeButton);
+                console.log(`Button message sent!`);
             } else if (progressMessageId) {
-                // Edit the progress message with the completion result
-                await editTelegramMessage(chatId, progressMessageId, caption);
+                // Edit the progress message with the completion result + button
+                await editTelegramMessage(chatId, progressMessageId, caption, analyzeButton);
             } else {
                 // Fallback: send new message if we don't have progressMessageId
-                await sendTelegramMessage(chatId, caption);
+                await sendTelegramMessage(chatId, caption, analyzeButton);
             }
 
             // Clean up active download record on success

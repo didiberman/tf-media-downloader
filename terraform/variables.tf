@@ -48,3 +48,9 @@ variable "telegram_webhook_secret" {
   type        = string
   sensitive   = true
 }
+
+variable "openrouter_api_key" {
+  description = "OpenRouter API key for Gemini/Claude video analysis"
+  type        = string
+  sensitive   = true
+}

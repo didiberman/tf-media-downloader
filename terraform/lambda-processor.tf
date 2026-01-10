@@ -13,7 +13,7 @@ resource "aws_lambda_function" "processor" {
   runtime          = "nodejs22.x"
   role             = aws_iam_role.processor_lambda.arn
   timeout          = 900 # 15 minutes for large downloads
-  memory_size      = 1024
+  memory_size      = 1536 # Increased for video analysis
   ephemeral_storage {
     size = 2048 # 2GB temp storage for videos
   }
@@ -30,6 +30,7 @@ resource "aws_lambda_function" "processor" {
       DYNAMODB_TABLE_NAME      = aws_dynamodb_table.users.name
       DYNAMODB_FILES_TABLE     = aws_dynamodb_table.files.name
       DYNAMODB_ACTIVE_DOWNLOADS_TABLE = aws_dynamodb_table.active_downloads.name
+      OPENROUTER_API_KEY       = var.openrouter_api_key
 
       AWS_REGION_OVERRIDE      = var.aws_region
     }

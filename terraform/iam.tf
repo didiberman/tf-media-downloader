@@ -145,6 +145,14 @@ resource "aws_iam_role_policy" "processor_lambda" {
         Effect   = "Allow"
         Action   = "kms:Decrypt"
         Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "transcribe:StartTranscriptionJob",
+          "transcribe:GetTranscriptionJob"
+        ]
+        Resource = "*"
       }
     ]
   })
