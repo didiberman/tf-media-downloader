@@ -567,8 +567,24 @@ export async function handler(event) {
             // Try to upload directly to Telegram
             const uploadSuccess = await uploadToTelegram(chatId, filePath, caption);
 
-            // If upload failed or was skipped (too large), send the link message
-            if (!uploadSuccess) {
+            // If upload succeeded, we can delete the progress message (file itself has caption)
+            // If upload failed or was skipped, edit the progress message with the result
+            if (uploadSuccess && progressMessageId) {
+                // Delete the "Processing..." message since we sent the file with caption
+                try {
+                    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ chat_id: chatId, message_id: progressMessageId })
+                    });
+                } catch (e) {
+                    console.error('Failed to delete progress message:', e.message);
+                }
+            } else if (progressMessageId) {
+                // Edit the progress message with the completion result
+                await editTelegramMessage(chatId, progressMessageId, caption);
+            } else {
+                // Fallback: send new message if we don't have progressMessageId
                 await sendTelegramMessage(chatId, caption);
             }
 
@@ -580,12 +596,16 @@ export async function handler(event) {
             // Clean up active download record on failure
             await deleteActiveDownload(downloadId);
 
-            await sendTelegramMessage(
-                chatId,
-                `❌ <b>Download Failed</b>\n\n` +
+            // Edit progress message with error, or send new message if no progressMessageId
+            const errorMsg = `❌ <b>Download Failed</b>\n\n` +
                 `Sorry, I couldn't download that media.\n\n` +
-                `<i>Error: ${error.message}</i>`
-            );
+                `<i>Error: ${error.message}</i>`;
+
+            if (progressMessageId) {
+                await editTelegramMessage(chatId, progressMessageId, errorMsg);
+            } else {
+                await sendTelegramMessage(chatId, errorMsg);
+            }
         } finally {
             // Cleanup temp file/dir
             if (filePath) {

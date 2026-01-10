@@ -14,9 +14,10 @@ A serverless Telegram bot that downloads media from Instagram and YouTube, store
                                                            │
                                                            ▼
 ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-│   S3 Bucket     │◀─────│ Processor Lambda│◀─────│   DynamoDB x2   │
-│ (7-day Lifecycle│      │ (yt-dlp + Send) │      │ (Users + Files) │
-└─────────────────┘      └─────────────────┘      └─────────────────┘
+│   S3 Bucket     │◀─────│ Processor Lambda│◀─────│  DynamoDB x3    │
+│ (7-day Lifecycle│      │ (yt-dlp + Send) │      │ (Users + Files  │
+└─────────────────┘      └─────────────────┘      │  + Active DLs)  │
+                                                  └─────────────────┘
 ```
 
 ---
@@ -28,8 +29,9 @@ A serverless Telegram bot that downloads media from Instagram and YouTube, store
 | **Lambda** (Webhook) | Receives Telegram webhooks, authenticates users, routes commands | Node.js 22, 256MB, 30s timeout |
 | **Lambda** (Processor) | Downloads media with yt-dlp, uploads to S3, sends to Telegram | Node.js 22, 1024MB, 900s timeout, Custom Lambda Layer |
 | **SQS** | Decouples webhook from processor, handles retry logic | 900s visibility timeout, DLQ after 3 attempts |
-| **DynamoDB** (`users`) | Stores user auth status, usage stats (MB downloaded) | PAY_PER_REQUEST, PK: `username` |
+| **DynamoDB** (`users`) | Stores user auth status, usage stats (total + per-platform) | PAY_PER_REQUEST, PK: `username` |
 | **DynamoDB** (`files`) | Indexes downloaded files for deduplication and listing | PAY_PER_REQUEST, PK: `file_key`, TTL enabled |
+| **DynamoDB** (`active_downloads`) | Tracks in-progress downloads for real-time status | PAY_PER_REQUEST, PK: `download_id`, TTL: 15min |
 | **S3** | Stores downloaded media files | 7-day lifecycle expiration on `downloads/` prefix |
 | **Secrets Manager** | Stores Instagram/YouTube cookies for authentication | Retrieved at runtime by Processor Lambda |
 | **IAM** | Least-privilege policies for each Lambda | Separate roles per function |
@@ -155,11 +157,51 @@ cd layers/yt-dlp
 | `/users` | List allowed users |
 | `/add @user` | Add user to allowlist |
 | `/remove @user` | Remove user |
-| `/stats` | View per-user usage (MB downloaded) |
-| `/list` | List all indexed files |
+| `/stats` | View per-user usage (total + YouTube/Instagram breakdown) |
+| `/list` | List all indexed files + active downloads with progress |
 | `/list youtube` | List YouTube downloads only |
 | `/list instagram` | List Instagram downloads only |
-| `/clear` | Delete all DynamoDB records (users + files) |
+| `/clear` | Delete all file records (preserves user stats) |
+
+---
+
+## Real-Time Progress Tracking
+
+Active downloads show live progress updates:
+
+1. **In Telegram**: The "Processing..." message updates every 5 seconds with current download percentage and speed
+2. **In `/list`**: Shows active downloads with percentage, speed, user, and elapsed time
+
+**Phases shown:**
+- 📥 Starting download...
+- 📥 Downloading... **45.2%** (2.5MiB/s)
+- 🎵 Converting to MP3... (for audio extraction)
+
+**Example `/list` output:**
+```
+⏳ Active Downloads
+
+📥 45.2% (2.5MiB/s)
+   👤 @username | 🏷️ youtube-long
+   🔗 https://youtube.com/watch?v=...
+   ⏱️ 1m 23s
+
+-------------------
+
+📂 Downloaded Files
+...
+```
+
+---
+
+## Webhook Security
+
+Telegram webhook requests are authenticated using a secret token:
+
+1. Set in `terraform.tfvars`: `telegram_webhook_secret = "<random-string>"`
+2. Passed to Telegram via `setWebhook` API
+3. Validated in Lambda via `X-Telegram-Bot-Api-Secret-Token` header
+4. Requests without valid token return `403 Forbidden`
 
 ---
 
@@ -170,9 +212,11 @@ cd layers/yt-dlp
 |----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
 | `TELEGRAM_ADMIN_USERNAME` | Admin username (no @) |
+| `TELEGRAM_WEBHOOK_SECRET` | Secret token for webhook authentication |
 | `SQS_QUEUE_URL` | URL of download queue |
 | `DYNAMODB_TABLE_NAME` | Name of users table |
 | `DYNAMODB_FILES_TABLE` | Name of files table |
+| `DYNAMODB_ACTIVE_DOWNLOADS_TABLE` | Name of active downloads table |
 
 ### Processor Lambda
 | Variable | Description |
@@ -184,6 +228,7 @@ cd layers/yt-dlp
 | `YOUTUBE_PROXY` | Proxy URL for YouTube (bypass IP blocks) |
 | `DYNAMODB_TABLE_NAME` | Name of users table |
 | `DYNAMODB_FILES_TABLE` | Name of files table |
+| `DYNAMODB_ACTIVE_DOWNLOADS_TABLE` | Name of active downloads table |
 
 ---
 
