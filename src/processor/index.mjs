@@ -85,8 +85,10 @@ async function editTelegramMessage(chatId, messageId, text) {
             }),
         });
         const result = await response.json();
-        if (!response.ok) {
+        if (!response.ok || !result.ok) {
             console.warn('Telegram edit failed:', JSON.stringify(result));
+        } else {
+            console.log('Telegram message edited successfully');
         }
         return result;
     } catch (error) {
@@ -180,14 +182,18 @@ async function updateActiveDownload(downloadId, percent, speed) {
         await ddb.send(new UpdateItemCommand({
             TableName: DYNAMODB_ACTIVE_DOWNLOADS_TABLE,
             Key: { download_id: { S: downloadId } },
-            UpdateExpression: 'SET #status = :status, percent = :percent, speed = :speed',
-            ExpressionAttributeNames: { '#status': 'status' },
+            UpdateExpression: 'SET #status = :status, #percent = :percent, speed = :speed',
+            ExpressionAttributeNames: {
+                '#status': 'status',
+                '#percent': 'percent'
+            },
             ExpressionAttributeValues: {
                 ':status': { S: 'downloading' },
                 ':percent': { S: percent },
                 ':speed': { S: speed || 'N/A' }
             }
         }));
+        console.log(`Updated active download ${downloadId}: ${percent}`);
     } catch (error) {
         console.error('Failed to update active download:', error.message);
     }
@@ -267,11 +273,14 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
                             // Bypass throttle for phase change to ensure it's shown
                             console.log('Phase change detected: postprocess');
                             lastUpdateTime = now;
-                            await updateActiveDownload(downloadId, 'converting', '');
+
+                            const updates = [];
+                            updates.push(updateActiveDownload(downloadId, 'converting', ''));
                             if (chatId && progressMessageId) {
                                 console.log(`Editing message for postprocess: ${progressMessageId}`);
-                                await editTelegramMessage(chatId, progressMessageId, `🎵 Converting to MP3...\n\n<i>Almost done...</i>`);
+                                updates.push(editTelegramMessage(chatId, progressMessageId, `🎵 Converting to MP3...\n\n<i>Almost done...</i>`));
                             }
+                            await Promise.allSettled(updates);
                         } else {
                             percent = json.percent;
                             speed = json.speed;
@@ -296,15 +305,22 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
                     if (now - lastUpdateTime >= UPDATE_INTERVAL) {
                         console.log(`Triggering progress update: ${percent} (${speed})`);
                         lastUpdateTime = now;
-                        await updateActiveDownload(downloadId, percent, speed);
 
-                        // Also update the Telegram message with progress
+                        // Create progress text
+                        const progressText = `📥 Downloading... <b>${percent}</b>` +
+                            (speed ? ` (${speed})` : '') +
+                            `\n\n<i>Please wait...</i>`;
+
+                        // Update Telegram and DB in parallel (one failure won't block the other)
+                        const updates = [];
+
+                        updates.push(updateActiveDownload(downloadId, percent, speed));
+
                         if (chatId && progressMessageId) {
-                            const progressText = `📥 Downloading... <b>${percent}</b>` +
-                                (speed ? ` (${speed})` : '') +
-                                `\n\n<i>Please wait...</i>`;
-                            await editTelegramMessage(chatId, progressMessageId, progressText);
+                            updates.push(editTelegramMessage(chatId, progressMessageId, progressText));
                         }
+
+                        await Promise.allSettled(updates);
                     }
                 }
             }
@@ -333,11 +349,14 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
                             // Bypass throttle for phase change
                             console.log('Phase change detected in stderr: postprocess');
                             lastUpdateTime = now;
-                            await updateActiveDownload(downloadId, 'converting', '');
+
+                            const updates = [];
+                            updates.push(updateActiveDownload(downloadId, 'converting', ''));
                             if (chatId && progressMessageId) {
                                 console.log(`Editing message for postprocess (stderr): ${progressMessageId}`);
-                                await editTelegramMessage(chatId, progressMessageId, `🎵 Converting to MP3...\n\n<i>Almost done...</i>`);
+                                updates.push(editTelegramMessage(chatId, progressMessageId, `🎵 Converting to MP3...\n\n<i>Almost done...</i>`));
                             }
+                            await Promise.allSettled(updates);
                         } else {
                             percent = json.percent;
                             speed = json.speed;
@@ -361,15 +380,18 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
                     if (now - lastUpdateTime >= UPDATE_INTERVAL) {
                         console.log(`Triggering stderr progress update: ${percent} (${speed})`);
                         lastUpdateTime = now;
-                        await updateActiveDownload(downloadId, percent, speed);
 
-                        // Also update the Telegram message with progress
+                        // Create progress text
+                        const progressText = `📥 Downloading... <b>${percent}</b>` +
+                            (speed ? ` (${speed})` : '') +
+                            `\n\n<i>Please wait...</i>`;
+
+                        const updates = [];
+                        updates.push(updateActiveDownload(downloadId, percent, speed));
                         if (chatId && progressMessageId) {
-                            const progressText = `📥 Downloading... <b>${percent}</b>` +
-                                (speed ? ` (${speed})` : '') +
-                                `\n\n<i>Please wait...</i>`;
-                            await editTelegramMessage(chatId, progressMessageId, progressText);
+                            updates.push(editTelegramMessage(chatId, progressMessageId, progressText));
                         }
+                        await Promise.allSettled(updates);
                     }
                 }
             }
