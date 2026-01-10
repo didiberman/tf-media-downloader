@@ -1,0 +1,227 @@
+# Media Downloader Telegram Bot
+
+A serverless Telegram bot that downloads media from Instagram and YouTube, stores it in S3 with automatic 7-day expiration, and manages user access via DynamoDB.
+
+---
+
+## Architecture
+
+```
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│   Telegram      │─────▶│  Webhook Lambda │─────▶│      SQS        │
+│   (User Input)  │      │  (Auth + Route) │      │  (Message Queue)│
+└─────────────────┘      └─────────────────┘      └────────┬────────┘
+                                                           │
+                                                           ▼
+┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+│   S3 Bucket     │◀─────│ Processor Lambda│◀─────│   DynamoDB x2   │
+│ (7-day Lifecycle│      │ (yt-dlp + Send) │      │ (Users + Files) │
+└─────────────────┘      └─────────────────┘      └─────────────────┘
+```
+
+---
+
+## AWS Services Used
+
+| Service | Purpose | Key Configuration |
+|---------|---------|-------------------|
+| **Lambda** (Webhook) | Receives Telegram webhooks, authenticates users, routes commands | Node.js 22, 256MB, 30s timeout |
+| **Lambda** (Processor) | Downloads media with yt-dlp, uploads to S3, sends to Telegram | Node.js 22, 1024MB, 900s timeout, Custom Lambda Layer |
+| **SQS** | Decouples webhook from processor, handles retry logic | 900s visibility timeout, DLQ after 3 attempts |
+| **DynamoDB** (`users`) | Stores user auth status, usage stats (MB downloaded) | PAY_PER_REQUEST, PK: `username` |
+| **DynamoDB** (`files`) | Indexes downloaded files for deduplication and listing | PAY_PER_REQUEST, PK: `file_key`, TTL enabled |
+| **S3** | Stores downloaded media files | 7-day lifecycle expiration on `downloads/` prefix |
+| **Secrets Manager** | Stores Instagram/YouTube cookies for authentication | Retrieved at runtime by Processor Lambda |
+| **IAM** | Least-privilege policies for each Lambda | Separate roles per function |
+
+---
+
+## Key Implementation Details
+
+### 1. Webhook Lambda (`src/webhook/index.mjs`)
+
+**Responsibilities:**
+- Parse Telegram webhook payload
+- Authenticate user against DynamoDB allowlist
+- Handle admin commands (`/add`, `/remove`, `/stats`, `/list`, `/clear`, `/help`, `/users`)
+- Extract and validate URLs (Instagram/YouTube patterns)
+- Queue valid requests to SQS
+
+**Auth Flow:**
+```javascript
+// Admin auto-allowed, others checked against DynamoDB
+if (username === TELEGRAM_ADMIN_USERNAME) return true;
+const response = await ddb.GetItem({ Key: { username } });
+return response.Item?.is_allowed?.BOOL === true;
+```
+
+### 2. Processor Lambda (`src/processor/index.mjs`)
+
+**Responsibilities:**
+- Consume SQS messages
+- Download media using yt-dlp with platform-specific cookies
+- Upload to S3 with deduplication (HeadObject check)
+- Generate presigned URL (7-day expiry)
+- Send file directly to Telegram (if < 50MB) or send S3 link
+- Update usage stats in DynamoDB
+- Index file in `files` table with TTL
+
+**yt-dlp Arguments:**
+```javascript
+const args = [
+  '--no-playlist',
+  '--restrict-filenames',
+  '--socket-timeout', '10',
+  '--extractor-args', 'youtube:player_client=ios',
+  '--format', 'best[ext=mp4]/best',
+  '-o', `${tempDir}/%(title)s [%(id)s].%(ext)s`,
+  '--cookies', cookiesPath,
+  '--proxy', YOUTUBE_PROXY, // For YouTube only
+];
+```
+
+### 3. DynamoDB TTL (Time-To-Live)
+
+Files are automatically deleted from DynamoDB when their `ttl` attribute (epoch seconds) is reached.
+
+**Implementation:**
+```javascript
+// Processor saves TTL = now + 7 days
+const ttlSeconds = Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60);
+await ddb.PutItem({
+  Item: { ..., ttl: { N: String(ttlSeconds) } }
+});
+```
+
+**Terraform:**
+```hcl
+resource "aws_dynamodb_table" "files" {
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+}
+```
+
+### 4. S3 Lifecycle Policy
+
+Files in `downloads/` prefix are automatically deleted after 7 days.
+
+```hcl
+resource "aws_s3_bucket_lifecycle_configuration" "media" {
+  rule {
+    id     = "expire-after-7-days"
+    status = "Enabled"
+    filter { prefix = "downloads/" }
+    expiration { days = 7 }
+  }
+}
+```
+
+### 5. Deduplication
+
+Before downloading, the Processor checks if the S3 key already exists:
+```javascript
+try {
+  await s3.send(new HeadObjectCommand({ Bucket, Key }));
+  // File exists, return existing presigned URL
+  return getSignedUrl(s3, new GetObjectCommand({ Bucket, Key }), { expiresIn });
+} catch (e) {
+  if (e.name === 'NotFound') {
+    // Proceed with download
+  }
+}
+```
+
+### 6. Lambda Layer (yt-dlp + FFmpeg)
+
+Custom Lambda Layer containing:
+- `yt-dlp` binary (for media extraction)
+- `ffmpeg` binary (for audio/video processing)
+
+**Build process:**
+```bash
+cd layers/yt-dlp
+./build.sh  # Downloads binaries and packages as ZIP
+```
+
+---
+
+## Admin Commands
+
+| Command | Description |
+|---------|-------------|
+| `/help` | List all commands |
+| `/users` | List allowed users |
+| `/add @user` | Add user to allowlist |
+| `/remove @user` | Remove user |
+| `/stats` | View per-user usage (MB downloaded) |
+| `/list` | List all indexed files |
+| `/list youtube` | List YouTube downloads only |
+| `/list instagram` | List Instagram downloads only |
+| `/clear` | Delete all DynamoDB records (users + files) |
+
+---
+
+## Environment Variables
+
+### Webhook Lambda
+| Variable | Description |
+|----------|-------------|
+| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
+| `TELEGRAM_ADMIN_USERNAME` | Admin username (no @) |
+| `SQS_QUEUE_URL` | URL of download queue |
+| `DYNAMODB_TABLE_NAME` | Name of users table |
+| `DYNAMODB_FILES_TABLE` | Name of files table |
+
+### Processor Lambda
+| Variable | Description |
+|----------|-------------|
+| `S3_BUCKET_NAME` | Bucket for media storage |
+| `TELEGRAM_BOT_TOKEN` | Bot token |
+| `INSTAGRAM_COOKIES_SECRET` | Secrets Manager ARN |
+| `YOUTUBE_COOKIES_SECRET` | Secrets Manager ARN |
+| `YOUTUBE_PROXY` | Proxy URL for YouTube (bypass IP blocks) |
+| `DYNAMODB_TABLE_NAME` | Name of users table |
+| `DYNAMODB_FILES_TABLE` | Name of files table |
+
+---
+
+## Deployment
+
+```bash
+# 1. Build Lambda Layer
+cd layers/yt-dlp && ./build.sh
+
+# 2. Configure variables
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with your values
+
+# 3. Deploy
+terraform init
+terraform apply
+
+# 4. Set Telegram webhook
+terraform output -raw set_webhook_command | bash
+```
+
+---
+
+## Key Learnings (Cloud Education)
+
+1. **Decoupled Architecture**: SQS between Webhook/Processor enables async processing, retry handling, and DLQ for failed messages.
+
+2. **IAM Least Privilege**: Each Lambda has its own role with only the permissions it needs (e.g., Webhook can't write to S3).
+
+3. **DynamoDB TTL vs S3 Lifecycle**: Both expire data automatically, but must be configured separately to stay in sync.
+
+4. **Presigned URLs**: S3 objects stay private; access is granted via time-limited signed URLs.
+
+5. **Lambda Layers**: Heavy binaries (yt-dlp, ffmpeg) are packaged separately, keeping function code small.
+
+6. **Secrets Manager**: Sensitive data (cookies) never stored in code or environment variables.
+
+7. **Lambda Timeout Considerations**: Processor needs 15-minute timeout for large downloads; SQS visibility timeout must match.
+
+8. **Proxy for IP Blocking**: YouTube blocks AWS IPs; residential proxy solves this.

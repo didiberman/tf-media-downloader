@@ -1,0 +1,403 @@
+import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+import { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand, ScanCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
+
+const sqs = new SQSClient({});
+const ddb = new DynamoDBClient({});
+
+const SQS_QUEUE_URL = process.env.SQS_QUEUE_URL;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const DYNAMODB_TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+const DYNAMODB_FILES_TABLE = process.env.DYNAMODB_FILES_TABLE;
+const TELEGRAM_ADMIN_USERNAME = process.env.TELEGRAM_ADMIN_USERNAME;
+
+// URL patterns for supported sources
+const patterns = {
+  instagramStory: /instagram\.com\/stories\/[^\/]+\/\d+/i,
+  instagramReel: /instagram\.com\/(reel|reels|p)\/[\w-]+/i,
+  youtubeShort: /(youtube\.com\/shorts\/|youtu\.be\/[\w-]{11}$)/i,
+  youtubeLong: /(youtube\.com\/watch\?v=|youtu\.be\/[\w-]+)/i,
+};
+
+async function sendTelegramMessage(chatId, text) {
+  const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+    return response.json();
+  } catch (error) {
+    console.error('Failed to send Telegram message:', error);
+  }
+}
+
+async function checkAuth(username) {
+  if (!username) return false;
+
+  // Auto-allow admin
+  if (username === TELEGRAM_ADMIN_USERNAME) {
+    await ensureUserExists(username, true, 'admin');
+    return true;
+  }
+
+  try {
+    const command = new GetItemCommand({
+      TableName: DYNAMODB_TABLE_NAME,
+      Key: { username: { S: username } },
+    });
+    const response = await ddb.send(command);
+    return response.Item?.is_allowed?.BOOL === true;
+  } catch (error) {
+    console.error('Auth check error:', error);
+    return false;
+  }
+}
+
+async function ensureUserExists(username, isAllowed = false, role = 'user') {
+  try {
+    const command = new PutItemCommand({
+      TableName: DYNAMODB_TABLE_NAME,
+      Item: {
+        username: { S: username },
+        is_allowed: { BOOL: isAllowed },
+        role: { S: role },
+        conversations: { N: '0' },
+        total_mb: { N: '0' },
+        platform_usage: { M: {} },
+        created_at: { S: new Date().toISOString() }
+      },
+      ConditionExpression: 'attribute_not_exists(username)'
+    });
+    await ddb.send(command);
+  } catch (error) {
+    if (error.name !== 'ConditionalCheckFailedException') {
+      console.error('Ensure user error:', error);
+    }
+  }
+}
+
+async function handleAdminCommands(chatId, text, senderUsername) {
+  if (senderUsername !== TELEGRAM_ADMIN_USERNAME) return false;
+
+  const parts = text.split(' ');
+  const command = parts[0];
+  const targetUser = parts[1]?.replace('@', '');
+
+  if (command === '/add' && targetUser) {
+    try {
+      await ddb.send(new UpdateItemCommand({
+        TableName: DYNAMODB_TABLE_NAME,
+        Key: { username: { S: targetUser } },
+        UpdateExpression: 'SET is_allowed = :allowed, #role = :role, created_at = if_not_exists(created_at, :now)',
+        ExpressionAttributeNames: { '#role': 'role' },
+        ExpressionAttributeValues: {
+          ':allowed': { BOOL: true },
+          ':role': { S: 'user' },
+          ':now': { S: new Date().toISOString() }
+        }
+      }));
+      await sendTelegramMessage(chatId, `✅ User @${targetUser} added to allowlist.`);
+    } catch (error) {
+      await sendTelegramMessage(chatId, `❌ Failed to add user: ${error.message}`);
+    }
+    return true;
+  }
+
+  if (command === '/remove' && targetUser) {
+    try {
+      await ddb.send(new UpdateItemCommand({
+        TableName: DYNAMODB_TABLE_NAME,
+        Key: { username: { S: targetUser } },
+        UpdateExpression: 'SET is_allowed = :allowed',
+        ExpressionAttributeValues: { ':allowed': { BOOL: false } }
+      }));
+      await sendTelegramMessage(chatId, `🚫 User @${targetUser} removed from allowlist.`);
+    } catch (error) {
+      await sendTelegramMessage(chatId, `❌ Failed to remove user: ${error.message}`);
+    }
+    return true;
+  }
+
+  if (command === '/stats') {
+    try {
+      const scan = await ddb.send(new ScanCommand({ TableName: DYNAMODB_TABLE_NAME }));
+      let statsMsg = '📊 <b>Usage Statistics</b>\n\n';
+
+      for (const item of scan.Items || []) {
+        const user = item.username.S;
+        const mb = parseFloat(item.total_mb?.N || 0).toFixed(1);
+        const reqs = item.conversations?.N || 0;
+        const allowed = item.is_allowed?.BOOL ? '✅' : '🚫';
+
+        statsMsg += `${allowed} <b>@${user}</b>\n`;
+        statsMsg += `   💾 ${mb} MB | 🔄 ${reqs} reqs\n\n`;
+      }
+
+      await sendTelegramMessage(chatId, statsMsg);
+    } catch (error) {
+      await sendTelegramMessage(chatId, `❌ Failed to fetch stats: ${error.message}`);
+    }
+    return true;
+  }
+
+  // USERS LIST COMMAND
+  if (command === '/users') {
+    try {
+      const scan = await ddb.send(new ScanCommand({ TableName: DYNAMODB_TABLE_NAME }));
+      let msg = '👥 <b>Allowed Users</b>\n\n';
+      let count = 0;
+
+      for (const item of scan.Items || []) {
+        if (item.is_allowed?.BOOL) {
+          msg += `• @${item.username.S}\n`;
+          count++;
+        }
+      }
+
+      if (count === 0) msg += 'No allowed users.';
+      else msg += `\nTotal: ${count}`;
+
+      await sendTelegramMessage(chatId, msg);
+    } catch (error) {
+      await sendTelegramMessage(chatId, `❌ Failed to list users: ${error.message}`);
+    }
+    return true;
+  }
+
+  // HELP COMMAND
+  if (command === '/help') {
+    const helpMsg = '🤖 <b>Admin Commands</b>\n\n' +
+      '<b>User Management</b>\n' +
+      '• /users - List allowed users\n' +
+      '• /add @user - Add user to allowlist\n' +
+      '• /remove @user - Remove user\n\n' +
+      '<b>Stats & Files</b>\n' +
+      '• /stats - View usage stats\n' +
+      '• /list - List all files\n' +
+      '• /list youtube - List YouTube files\n' +
+      '• /list instagram - List Instagram files\n' +
+      '• /clear - ⚠️ Wipe DB & Files';
+
+    await sendTelegramMessage(chatId, helpMsg);
+    return true;
+  }
+
+  // LIST COMMANDS
+  if (command === '/list') {
+    const type = parts[1]; // 'youtube' or 'instagram' (optional)
+
+    try {
+      let items = [];
+      let header = '📂 <b>All Downloaded Files</b>\n\n';
+
+      if (type === 'youtube' || type === 'instagram') {
+        header = `📂 <b>${type.charAt(0).toUpperCase() + type.slice(1)} Downloads</b>\n\n`;
+        const scan = await ddb.send(new ScanCommand({
+          TableName: DYNAMODB_FILES_TABLE,
+          FilterExpression: 'contains(source_type, :type)',
+          ExpressionAttributeValues: { ':type': { S: type } }
+        }));
+        items = scan.Items || [];
+      } else {
+        // List ALL
+        const scan = await ddb.send(new ScanCommand({ TableName: DYNAMODB_FILES_TABLE }));
+        items = scan.Items || [];
+      }
+
+      if (items.length === 0) {
+        await sendTelegramMessage(chatId, header + 'No files found.');
+        return true;
+      }
+
+      let msg = header;
+      let totalMB = 0;
+
+      // Sort by date desc (if not already)
+      items.sort((a, b) => (b.created_at?.S || '').localeCompare(a.created_at?.S || ''));
+
+      // Limit to last 20 to avoid message size limits
+      const displayItems = items.slice(0, 20);
+
+      for (const item of displayItems) {
+        const title = item.title?.S || 'Unknown';
+        const size = parseFloat(item.size_mb?.N || 0);
+        const type = item.source_type?.S || 'misc';
+
+        msg += `📄 <b>${title}</b>\n`;
+        msg += `   📦 ${size.toFixed(1)} MB | 🏷️ ${type}\n\n`;
+      }
+
+      // Calculate total size
+      items.forEach(i => totalMB += parseFloat(i.size_mb?.N || 0));
+
+      msg += `-------------------\n`;
+      msg += `Total Stored: <b>${totalMB.toFixed(1)} MB</b> (${items.length} files)\n`;
+      if (items.length > 20) msg += `<i>(Showing first 20 of ${items.length})</i>`;
+
+      await sendTelegramMessage(chatId, msg);
+    } catch (error) {
+      await sendTelegramMessage(chatId, `❌ List failed: ${error.message}`);
+    }
+    return true;
+  }
+
+  // CLEAR COMMAND
+  if (command === '/clear') {
+    try {
+      await sendTelegramMessage(chatId, '⚠️ Clearing database and files... This may take a moment.');
+
+      // 1. Scan and delete all Users
+      const userScan = await ddb.send(new ScanCommand({ TableName: DYNAMODB_TABLE_NAME }));
+      for (const item of userScan.Items || []) {
+        await ddb.send(new DeleteItemCommand({
+          TableName: DYNAMODB_TABLE_NAME,
+          Key: { username: item.username }
+        }));
+      }
+
+      // 2. Scan and delete all Files records
+      const fileScan = await ddb.send(new ScanCommand({ TableName: DYNAMODB_FILES_TABLE }));
+      for (const item of fileScan.Items || []) {
+        await ddb.send(new DeleteItemCommand({
+          TableName: DYNAMODB_FILES_TABLE,
+          Key: { file_key: item.file_key }
+        }));
+      }
+
+      // Re-add Admin
+      await ensureUserExists(TELEGRAM_ADMIN_USERNAME, true, 'admin');
+
+      await sendTelegramMessage(chatId, '✅ Database cleared! Admin user restored.');
+
+    } catch (error) {
+      console.error(error);
+      await sendTelegramMessage(chatId, `❌ Clear failed: ${error.message}`);
+    }
+    return true;
+  }
+
+  return false;
+}
+
+function detectSource(url) {
+  if (patterns.instagramStory.test(url)) return 'instagram-story';
+  if (patterns.instagramReel.test(url)) return 'instagram-reel';
+  if (patterns.youtubeShort.test(url)) return 'youtube-short';
+  if (patterns.youtubeLong.test(url)) return 'youtube-long';
+  return null;
+}
+
+function extractUrl(text) {
+  const urlMatch = text.match(/https?:\/\/[^\s]+/i);
+  return urlMatch ? urlMatch[0] : null;
+}
+
+export async function handler(event) {
+  console.log('Received event:', JSON.stringify(event, null, 2));
+
+  try {
+    const body = JSON.parse(event.body || '{}');
+    const message = body.message;
+
+    if (!message?.text || !message?.chat?.id) {
+      return { statusCode: 200, body: 'OK' };
+    }
+
+    const chatId = message.chat.id;
+    const text = message.text;
+    const username = message.from?.username;
+
+    if (!username) {
+      await sendTelegramMessage(chatId, '❌ Please set a Telegram username to use this bot.');
+      return { statusCode: 200, body: 'OK' };
+    }
+
+    // AUTH CHECK
+    const isAllowed = await checkAuth(username);
+
+    // Handle Admin Commands if sender is admin
+    if (username === TELEGRAM_ADMIN_USERNAME && text.startsWith('/')) {
+      const handled = await handleAdminCommands(chatId, text, username);
+      if (handled) return { statusCode: 200, body: 'OK' };
+    }
+
+    if (!isAllowed) {
+      await sendTelegramMessage(chatId, '🚫 <b>Access Denied</b>\n\nYou are not authorized to use this bot. Contact the admin for access.');
+      return { statusCode: 200, body: 'OK' };
+    }
+
+    // Handle /start command
+    if (text === '/start') {
+      await sendTelegramMessage(
+        chatId,
+        '🎬 <b>Media Downloader Bot</b>\n\n' +
+        'Send me a link from:\n' +
+        '• Instagram Story\n' +
+        '• Instagram Reel\n' +
+        '• YouTube Short\n' +
+        '• YouTube Video\n\n' +
+        "I'll download it and send you an S3 link (valid for 60 days).\n\n" +
+        '<i>YouTube videos return MP3 audio only.</i>'
+      );
+      return { statusCode: 200, body: 'OK' };
+    }
+
+    // Extract URL from message
+    const url = extractUrl(text);
+    if (!url) {
+      await sendTelegramMessage(chatId, '❌ No valid URL found in your message.');
+      return { statusCode: 200, body: 'OK' };
+    }
+
+    // Detect source type
+    const sourceType = detectSource(url);
+    if (!sourceType) {
+      await sendTelegramMessage(
+        chatId,
+        '❌ Unsupported URL. Please send an Instagram or YouTube link.'
+      );
+      return { statusCode: 200, body: 'OK' };
+    }
+
+    // Queue the download request
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl: SQS_QUEUE_URL,
+        MessageBody: JSON.stringify({
+          chatId,
+          url,
+          sourceType,
+          messageId: message.message_id,
+          username: username, // Pass username for usage tracking
+        }),
+      })
+    );
+
+    // Send processing confirmation
+    const sourceEmoji = {
+      'instagram-story': '📸',
+      'instagram-reel': '🎞️',
+      'youtube-short': '📱',
+      'youtube-long': '🎵',
+    };
+
+    const outputType = sourceType === 'youtube-long' ? 'MP3' : 'MP4';
+
+    await sendTelegramMessage(
+      chatId,
+      `${sourceEmoji[sourceType]} Processing your ${sourceType.replace('-', ' ')}...\n\n` +
+      `<i>You'll receive an S3 link (${outputType}) shortly.</i>`
+    );
+
+    return { statusCode: 200, body: 'OK' };
+  } catch (error) {
+    console.error('Error:', error);
+    return { statusCode: 200, body: 'OK' };
+  }
+}
