@@ -1,10 +1,10 @@
-import { spawnSync } from 'child_process';
+import { spawn } from 'child_process';
 import { createReadStream, unlinkSync, writeFileSync, existsSync, readdirSync, openAsBlob, mkdirSync, rmSync, renameSync } from 'fs';
 import { stat } from 'fs/promises';
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { DynamoDBClient, UpdateItemCommand, PutItemCommand, GetItemCommand } from '@aws-sdk/client-dynamodb';
+import { DynamoDBClient, UpdateItemCommand, PutItemCommand, GetItemCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
 import { randomUUID } from 'crypto';
 
 const s3 = new S3Client({});
@@ -18,6 +18,7 @@ const YOUTUBE_COOKIES_SECRET = process.env.YOUTUBE_COOKIES_SECRET;
 const YOUTUBE_PROXY = process.env.YOUTUBE_PROXY;
 const DYNAMODB_TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
 const DYNAMODB_FILES_TABLE = process.env.DYNAMODB_FILES_TABLE;
+const DYNAMODB_ACTIVE_DOWNLOADS_TABLE = process.env.DYNAMODB_ACTIVE_DOWNLOADS_TABLE;
 
 // Paths to binaries in Lambda Layer
 const YTDLP_PATH = '/opt/bin/yt-dlp';
@@ -67,6 +68,27 @@ async function sendTelegramMessage(chatId, text) {
         }),
     });
     return response.json();
+}
+
+async function editTelegramMessage(chatId, messageId, text) {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText`;
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId,
+                text,
+                parse_mode: 'HTML',
+                disable_web_page_preview: true,
+            }),
+        });
+        return response.json();
+    } catch (error) {
+        console.error('Failed to edit Telegram message:', error.message);
+        return null;
+    }
 }
 
 async function uploadToTelegram(chatId, filePath, caption) {
@@ -136,10 +158,10 @@ function buildYtdlpArgs(sourceType, url, outputPath, cookiesPath) {
     }
 
     // Output template with Title and ID for valid filesystem name
-    args.push('-o', outputPath, '--no-playlist', '--no-warnings', '--restrict-filenames');
+    args.push('-o', outputPath, '--no-playlist', '--restrict-filenames');
 
-    // Debugging: Verbose output and socket timeout to catch proxy hangs
-    args.push('--verbose', '--socket-timeout', '10');
+    // Socket timeout to catch proxy hangs
+    args.push('--socket-timeout', '10');
 
     // Add URL
     args.push(url);
@@ -147,22 +169,65 @@ function buildYtdlpArgs(sourceType, url, outputPath, cookiesPath) {
     return args;
 }
 
-async function downloadMedia(sourceType, url, cookiesPath) {
+async function updateActiveDownload(downloadId, percent, speed) {
+    if (!DYNAMODB_ACTIVE_DOWNLOADS_TABLE || !downloadId) return;
+
+    try {
+        await ddb.send(new UpdateItemCommand({
+            TableName: DYNAMODB_ACTIVE_DOWNLOADS_TABLE,
+            Key: { download_id: { S: downloadId } },
+            UpdateExpression: 'SET #status = :status, percent = :percent, speed = :speed',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: {
+                ':status': { S: 'downloading' },
+                ':percent': { S: percent },
+                ':speed': { S: speed || 'N/A' }
+            }
+        }));
+    } catch (error) {
+        console.error('Failed to update active download:', error.message);
+    }
+}
+
+async function deleteActiveDownload(downloadId) {
+    if (!DYNAMODB_ACTIVE_DOWNLOADS_TABLE || !downloadId) return;
+
+    try {
+        await ddb.send(new DeleteItemCommand({
+            TableName: DYNAMODB_ACTIVE_DOWNLOADS_TABLE,
+            Key: { download_id: { S: downloadId } }
+        }));
+        console.log(`Deleted active download: ${downloadId}`);
+    } catch (error) {
+        console.error('Failed to delete active download:', error.message);
+    }
+}
+
+async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, progressMessageId) {
     const uuid = randomUUID();
     const tempDir = `/tmp/${uuid}`;
     mkdirSync(tempDir);
 
     // Template: "Title [ID].ext" 
-    // We use a unique dir so we can just grab the valid file created there.
     const outputTemplate = `${tempDir}/%(title)s [%(id)s].%(ext)s`;
 
     const args = buildYtdlpArgs(sourceType, url, outputTemplate, cookiesPath);
+
+    // Add progress template for JSON output (both download and postprocess phases)
+    args.push('--progress-template', 'download:{"percent":"%(progress._percent_str)s","speed":"%(progress._speed_str)s","phase":"download"}');
+    args.push('--progress-template', 'postprocess:{"phase":"postprocess"}');
+    args.push('--newline'); // Ensure each progress update is on a new line
+
     console.log('Running yt-dlp with args:', args);
 
-    try {
-        const result = spawnSync(YTDLP_PATH, args, {
-            timeout: 840000, // 14 minutes
-            maxBuffer: 50 * 1024 * 1024, // 50MB
+    // Immediately update status to show download is starting
+    if (chatId && progressMessageId) {
+        await editTelegramMessage(chatId, progressMessageId, `📥 Starting download...\n\n<i>Please wait...</i>`);
+    }
+    await updateActiveDownload(downloadId, 'starting', '');
+
+    return new Promise((resolve, reject) => {
+        const proc = spawn(YTDLP_PATH, args, {
             env: {
                 ...process.env,
                 PATH: '/opt/bin:/usr/bin:/bin',
@@ -170,39 +235,180 @@ async function downloadMedia(sourceType, url, cookiesPath) {
             },
         });
 
-        if (result.error) {
-            throw result.error;
-        }
+        let lastUpdateTime = Date.now(); // Start with current time to allow first update quickly
+        const UPDATE_INTERVAL = 5000; // 5 seconds
+        let stderr = '';
 
-        if (result.status !== 0) {
-            const stderr = result.stderr?.toString() || 'Unknown error';
+        proc.stdout.on('data', async (data) => {
+            const output = data.toString();
+            console.log('yt-dlp stdout:', output);
 
-            if (stderr.includes('Requested format is not available')) {
-                console.log('Format not available...');
+            // Parse progress - check both JSON template and standard format
+            const lines = output.split('\n');
+            for (const line of lines) {
+                let percent = null;
+                let speed = null;
+
+                // Try JSON template format: download:{"percent":"45.2%","speed":"2.5MiB/s","phase":"download"}
+                if (line.startsWith('download:') || line.startsWith('postprocess:')) {
+                    try {
+                        const jsonStart = line.indexOf('{');
+                        const json = JSON.parse(line.substring(jsonStart));
+
+                        if (json.phase === 'postprocess') {
+                            // Show converting message for postprocess phase
+                            const now = Date.now();
+                            if (now - lastUpdateTime >= UPDATE_INTERVAL) {
+                                lastUpdateTime = now;
+                                await updateActiveDownload(downloadId, 'converting', '');
+                                if (chatId && progressMessageId) {
+                                    await editTelegramMessage(chatId, progressMessageId, `🎵 Converting to MP3...\n\n<i>Almost done...</i>`);
+                                }
+                            }
+                        } else {
+                            percent = json.percent;
+                            speed = json.speed;
+                        }
+                    } catch (e) {
+                        // Ignore parse errors
+                    }
+                }
+
+                // Fallback: standard yt-dlp format: [download]  45.2% of 10.5MiB at 2.5MiB/s
+                if (!percent) {
+                    const match = line.match(/\[download\]\s+(\d+\.?\d*%)\s+of.*?(?:at\s+([^\s]+))?/i);
+                    if (match) {
+                        percent = match[1];
+                        speed = match[2] || '';
+                    }
+                }
+
+                if (percent) {
+                    const now = Date.now();
+                    // Throttle DynamoDB updates to every 5 seconds
+                    if (now - lastUpdateTime >= UPDATE_INTERVAL) {
+                        lastUpdateTime = now;
+                        await updateActiveDownload(downloadId, percent, speed);
+
+                        // Also update the Telegram message with progress
+                        if (chatId && progressMessageId) {
+                            const progressText = `📥 Downloading... <b>${percent}</b>` +
+                                (speed ? ` (${speed})` : '') +
+                                `\n\n<i>Please wait...</i>`;
+                            await editTelegramMessage(chatId, progressMessageId, progressText);
+                        }
+                    }
+                }
+            }
+        });
+
+        proc.stderr.on('data', async (data) => {
+            const output = data.toString();
+            stderr += output;
+            console.log('yt-dlp stderr:', output);
+
+            // Also check stderr for progress (some yt-dlp versions output progress here)
+            const lines = output.split('\n');
+            for (const line of lines) {
+                let percent = null;
+                let speed = null;
+
+                // Try JSON template format
+                if (line.startsWith('download:') || line.startsWith('postprocess:')) {
+                    try {
+                        const jsonStart = line.indexOf('{');
+                        const json = JSON.parse(line.substring(jsonStart));
+
+                        if (json.phase === 'postprocess') {
+                            const now = Date.now();
+                            if (now - lastUpdateTime >= UPDATE_INTERVAL) {
+                                lastUpdateTime = now;
+                                await updateActiveDownload(downloadId, 'converting', '');
+                                if (chatId && progressMessageId) {
+                                    await editTelegramMessage(chatId, progressMessageId, `🎵 Converting to MP3...\n\n<i>Almost done...</i>`);
+                                }
+                            }
+                        } else {
+                            percent = json.percent;
+                            speed = json.speed;
+                        }
+                    } catch (e) {
+                        // Ignore parse errors
+                    }
+                }
+
+                // Fallback: standard yt-dlp format
+                if (!percent) {
+                    const match = line.match(/\[download\]\s+(\d+\.?\d*%)\s+of.*?(?:at\s+([^\s]+))?/i);
+                    if (match) {
+                        percent = match[1];
+                        speed = match[2] || '';
+                    }
+                }
+
+                if (percent) {
+                    const now = Date.now();
+                    if (now - lastUpdateTime >= UPDATE_INTERVAL) {
+                        lastUpdateTime = now;
+                        await updateActiveDownload(downloadId, percent, speed);
+
+                        // Also update the Telegram message with progress
+                        if (chatId && progressMessageId) {
+                            const progressText = `📥 Downloading... <b>${percent}</b>` +
+                                (speed ? ` (${speed})` : '') +
+                                `\n\n<i>Please wait...</i>`;
+                            await editTelegramMessage(chatId, progressMessageId, progressText);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Set timeout
+        const timeout = setTimeout(() => {
+            proc.kill();
+            rmSync(tempDir, { recursive: true, force: true });
+            reject(new Error('Download timed out after 14 minutes'));
+        }, 840000);
+
+        proc.on('close', (code) => {
+            clearTimeout(timeout);
+
+            if (code !== 0) {
+                if (stderr.includes('Requested format is not available')) {
+                    console.log('Format not available...');
+                }
+                rmSync(tempDir, { recursive: true, force: true });
+                reject(new Error(`yt-dlp exited with code ${code}: ${stderr}`));
+                return;
             }
 
-            throw new Error(`yt-dlp exited with code ${result.status}: ${stderr}`);
-        }
+            // Find the downloaded file in the temp dir
+            try {
+                const files = readdirSync(tempDir);
+                const downloadedFile = files.find(f => !f.endsWith('.part') && !f.endsWith('.ytdl'));
 
-        console.log('yt-dlp output:', result.stdout?.toString());
+                if (!downloadedFile) {
+                    rmSync(tempDir, { recursive: true, force: true });
+                    reject(new Error('Downloaded file not found in temp dir'));
+                    return;
+                }
 
-        // Find the downloaded file in the temp dir
-        const files = readdirSync(tempDir);
-        const downloadedFile = files.find(f => !f.endsWith('.part') && !f.endsWith('.ytdl'));
+                const fullPath = `${tempDir}/${downloadedFile}`;
+                console.log('Downloaded file:', fullPath);
+                resolve(fullPath);
+            } catch (error) {
+                rmSync(tempDir, { recursive: true, force: true });
+                reject(error);
+            }
+        });
 
-        if (!downloadedFile) {
-            throw new Error('Downloaded file not found in temp dir');
-        }
-
-        const fullPath = `${tempDir}/${downloadedFile}`;
-        console.log('Downloaded file:', fullPath);
-        return fullPath;
-    } catch (error) {
-        console.error('yt-dlp error:', error.message);
-        // Clean up temp dir if failed
-        rmSync(tempDir, { recursive: true, force: true });
-        throw error;
-    }
+        proc.on('error', (error) => {
+            clearTimeout(timeout);
+            rmSync(tempDir, { recursive: true, force: true });
+            reject(error);
+        });
+    });
 }
 
 async function uploadToS3(filePath, sourceType) {
@@ -322,15 +528,15 @@ export async function handler(event) {
     console.log('Processing event:', JSON.stringify(event, null, 2));
 
     for (const record of event.Records) {
-        const { chatId, url, sourceType, username } = JSON.parse(record.body);
+        const { chatId, url, sourceType, username, downloadId, progressMessageId } = JSON.parse(record.body);
         let filePath = null;
 
         try {
             // Get cookies if available
             const cookiesPath = await getCookiesForSource(sourceType);
 
-            // Download with yt-dlp
-            filePath = await downloadMedia(sourceType, url, cookiesPath);
+            // Download with yt-dlp (pass downloadId, chatId, progressMessageId for progress tracking)
+            filePath = await downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, progressMessageId);
             const stats = await stat(filePath);
             const fileSizeMB = stats.size / (1024 * 1024);
 
@@ -365,8 +571,14 @@ export async function handler(event) {
             if (!uploadSuccess) {
                 await sendTelegramMessage(chatId, caption);
             }
+
+            // Clean up active download record on success
+            await deleteActiveDownload(downloadId);
         } catch (error) {
             console.error('Processing error:', error);
+
+            // Clean up active download record on failure
+            await deleteActiveDownload(downloadId);
 
             await sendTelegramMessage(
                 chatId,

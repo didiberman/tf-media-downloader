@@ -29,6 +29,7 @@ resource "aws_lambda_function" "processor" {
       YOUTUBE_PROXY            = var.youtube_proxy
       DYNAMODB_TABLE_NAME      = aws_dynamodb_table.users.name
       DYNAMODB_FILES_TABLE     = aws_dynamodb_table.files.name
+      DYNAMODB_ACTIVE_DOWNLOADS_TABLE = aws_dynamodb_table.active_downloads.name
 
       AWS_REGION_OVERRIDE      = var.aws_region
     }

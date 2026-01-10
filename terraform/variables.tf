@@ -42,3 +42,9 @@ variable "telegram_admin_username" {
   description = "Telegram username of the bot admin (without @)"
   type        = string
 }
+
+variable "telegram_webhook_secret" {
+  description = "Secret token for Telegram webhook authentication"
+  type        = string
+  sensitive   = true
+}

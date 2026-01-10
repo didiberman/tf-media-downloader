@@ -1,5 +1,6 @@
 import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
 import { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand, ScanCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
+import { randomUUID } from 'crypto';
 
 const sqs = new SQSClient({});
 const ddb = new DynamoDBClient({});
@@ -8,7 +9,9 @@ const SQS_QUEUE_URL = process.env.SQS_QUEUE_URL;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const DYNAMODB_TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
 const DYNAMODB_FILES_TABLE = process.env.DYNAMODB_FILES_TABLE;
+const DYNAMODB_ACTIVE_DOWNLOADS_TABLE = process.env.DYNAMODB_ACTIVE_DOWNLOADS_TABLE;
 const TELEGRAM_ADMIN_USERNAME = process.env.TELEGRAM_ADMIN_USERNAME;
+const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET;
 
 // URL patterns for supported sources
 const patterns = {
@@ -193,8 +196,47 @@ async function handleAdminCommands(chatId, text, senderUsername) {
     const type = parts[1]; // 'youtube' or 'instagram' (optional)
 
     try {
+      // First, get active downloads
+      let activeDownloads = [];
+      if (DYNAMODB_ACTIVE_DOWNLOADS_TABLE) {
+        const activeScan = await ddb.send(new ScanCommand({ TableName: DYNAMODB_ACTIVE_DOWNLOADS_TABLE }));
+        activeDownloads = activeScan.Items || [];
+      }
+
+      // Show active downloads section
+      let msg = '';
+      if (activeDownloads.length > 0) {
+        msg += '⏳ <b>Active Downloads</b>\n\n';
+        for (const item of activeDownloads) {
+          const user = item.username?.S || 'Unknown';
+          const sourceUrl = item.url?.S || 'N/A';
+          const percent = item.percent?.S || '0%';
+          const speed = item.speed?.S || '';
+          const sourceType = item.source_type?.S || '';
+          const startedAt = item.started_at?.S;
+
+          // Calculate elapsed time
+          let elapsed = '';
+          if (startedAt) {
+            const elapsedMs = Date.now() - new Date(startedAt).getTime();
+            const elapsedSec = Math.floor(elapsedMs / 1000);
+            elapsed = elapsedSec < 60 ? `${elapsedSec}s` : `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`;
+          }
+
+          // Truncate URL for display
+          const shortUrl = sourceUrl.length > 40 ? sourceUrl.substring(0, 40) + '...' : sourceUrl;
+
+          msg += `📥 <b>${percent}</b> ${speed ? `(${speed})` : ''}\n`;
+          msg += `   👤 @${user} | 🏷️ ${sourceType}\n`;
+          msg += `   🔗 ${shortUrl}\n`;
+          if (elapsed) msg += `   ⏱️ ${elapsed}\n`;
+          msg += '\n';
+        }
+        msg += '-------------------\n\n';
+      }
+
       let items = [];
-      let header = '📂 <b>All Downloaded Files</b>\n\n';
+      let header = '📂 <b>Downloaded Files</b>\n\n';
 
       if (type === 'youtube' || type === 'instagram') {
         header = `📂 <b>${type.charAt(0).toUpperCase() + type.slice(1)} Downloads</b>\n\n`;
@@ -210,18 +252,18 @@ async function handleAdminCommands(chatId, text, senderUsername) {
         items = scan.Items || [];
       }
 
-      if (items.length === 0) {
-        await sendTelegramMessage(chatId, header + 'No files found.');
+      if (items.length === 0 && activeDownloads.length === 0) {
+        await sendTelegramMessage(chatId, msg + header + 'No files found.');
         return true;
       }
 
-      let msg = header;
+      msg += header;
       let totalMB = 0;
 
-      // Sort by date desc (if not already)
+      // Sort by date desc
       items.sort((a, b) => (b.created_at?.S || '').localeCompare(a.created_at?.S || ''));
 
-      // Limit to last 20 to avoid message size limits
+      // Limit to last 20
       const displayItems = items.slice(0, 20);
 
       for (const item of displayItems) {
@@ -301,6 +343,15 @@ function extractUrl(text) {
 export async function handler(event) {
   console.log('Received event:', JSON.stringify(event, null, 2));
 
+  // Validate Telegram webhook secret token
+  if (TELEGRAM_WEBHOOK_SECRET) {
+    const secretHeader = event.headers?.['x-telegram-bot-api-secret-token'];
+    if (secretHeader !== TELEGRAM_WEBHOOK_SECRET) {
+      console.warn('Invalid or missing webhook secret token');
+      return { statusCode: 403, body: 'Forbidden' };
+    }
+  }
+
   try {
     const body = JSON.parse(event.body || '{}');
     const message = body.message;
@@ -365,21 +416,32 @@ export async function handler(event) {
       return { statusCode: 200, body: 'OK' };
     }
 
-    // Queue the download request
-    await sqs.send(
-      new SendMessageCommand({
-        QueueUrl: SQS_QUEUE_URL,
-        MessageBody: JSON.stringify({
-          chatId,
-          url,
-          sourceType,
-          messageId: message.message_id,
-          username: username, // Pass username for usage tracking
-        }),
-      })
-    );
+    // Generate unique download ID for tracking
+    const downloadId = randomUUID();
 
-    // Send processing confirmation
+    // Create active download record
+    if (DYNAMODB_ACTIVE_DOWNLOADS_TABLE) {
+      try {
+        const ttlSeconds = Math.floor(Date.now() / 1000) + (15 * 60); // 15 min TTL
+        await ddb.send(new PutItemCommand({
+          TableName: DYNAMODB_ACTIVE_DOWNLOADS_TABLE,
+          Item: {
+            download_id: { S: downloadId },
+            username: { S: username },
+            url: { S: url },
+            source_type: { S: sourceType },
+            status: { S: 'queued' },
+            percent: { S: '0%' },
+            started_at: { S: new Date().toISOString() },
+            ttl: { N: String(ttlSeconds) }
+          }
+        }));
+      } catch (error) {
+        console.error('Failed to create active download record:', error);
+      }
+    }
+
+    // Send processing confirmation FIRST and capture message_id
     const sourceEmoji = {
       'instagram-story': '📸',
       'instagram-reel': '🎞️',
@@ -389,10 +451,28 @@ export async function handler(event) {
 
     const outputType = sourceType === 'youtube-long' ? 'MP3' : 'MP4';
 
-    await sendTelegramMessage(
+    const processingMsg = await sendTelegramMessage(
       chatId,
       `${sourceEmoji[sourceType]} Processing your ${sourceType.replace('-', ' ')}...\n\n` +
       `<i>You'll receive an S3 link (${outputType}) shortly.</i>`
+    );
+
+    const progressMessageId = processingMsg?.result?.message_id;
+
+    // Queue the download request with progress message ID
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl: SQS_QUEUE_URL,
+        MessageBody: JSON.stringify({
+          chatId,
+          url,
+          sourceType,
+          messageId: message.message_id,
+          username: username,
+          downloadId: downloadId,
+          progressMessageId: progressMessageId, // For live progress updates
+        }),
+      })
     );
 
     return { statusCode: 200, body: 'OK' };

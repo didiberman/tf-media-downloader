@@ -10,6 +10,6 @@ output "s3_bucket_name" {
 
 output "set_webhook_command" {
   description = "Command to set Telegram webhook"
-  value       = "curl -X POST 'https://api.telegram.org/bot${var.telegram_bot_token}/setWebhook?url=${aws_lambda_function_url.webhook.function_url}'"
+  value       = "curl -X POST 'https://api.telegram.org/bot${var.telegram_bot_token}/setWebhook?url=${aws_lambda_function_url.webhook.function_url}&secret_token=${var.telegram_webhook_secret}'"
   sensitive   = true
 }

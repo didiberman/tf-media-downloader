@@ -48,7 +48,8 @@ resource "aws_iam_role_policy" "webhook_lambda" {
         Resource = [
           "${aws_dynamodb_table.users.arn}",
           "${aws_dynamodb_table.files.arn}",
-          "${aws_dynamodb_table.files.arn}/index/*"
+          "${aws_dynamodb_table.files.arn}/index/*",
+          "${aws_dynamodb_table.active_downloads.arn}"
         ]
       }
     ]
@@ -131,7 +132,8 @@ resource "aws_iam_role_policy" "processor_lambda" {
         Resource = [
           "${aws_dynamodb_table.users.arn}",
           "${aws_dynamodb_table.files.arn}",
-          "${aws_dynamodb_table.files.arn}/index/*"
+          "${aws_dynamodb_table.files.arn}/index/*",
+          "${aws_dynamodb_table.active_downloads.arn}"
         ]
       }
     ]

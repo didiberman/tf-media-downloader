@@ -49,3 +49,23 @@ resource "aws_dynamodb_table" "files" {
     Project = "media-downloader"
   }
 }
+
+resource "aws_dynamodb_table" "active_downloads" {
+  name         = "media-downloader-active-downloads"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "download_id"
+
+  attribute {
+    name = "download_id"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = {
+    Project = "media-downloader"
+  }
+}

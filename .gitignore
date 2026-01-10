@@ -1,2 +1,6 @@
 layers/yt-dlp/layer.zip
-/terraform
+/terraform/.builds
+/terraform/.terraform
+terraform/terraform.tfvars
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup

@@ -21,7 +21,9 @@ resource "aws_lambda_function" "webhook" {
       TELEGRAM_BOT_TOKEN      = var.telegram_bot_token
       DYNAMODB_TABLE_NAME     = aws_dynamodb_table.users.name
       DYNAMODB_FILES_TABLE    = aws_dynamodb_table.files.name
+      DYNAMODB_ACTIVE_DOWNLOADS_TABLE = aws_dynamodb_table.active_downloads.name
       TELEGRAM_ADMIN_USERNAME = var.telegram_admin_username
+      TELEGRAM_WEBHOOK_SECRET = var.telegram_webhook_secret
     }
   }
 }
