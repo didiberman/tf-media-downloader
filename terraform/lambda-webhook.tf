@@ -33,6 +33,14 @@ resource "aws_lambda_function_url" "webhook" {
   authorization_type = "NONE"
 }
 
+resource "aws_lambda_permission" "webhook_url" {
+  statement_id           = "AllowPublicInvoke"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.webhook.function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
+}
+
 resource "aws_cloudwatch_log_group" "webhook" {
   name              = "/aws/lambda/${aws_lambda_function.webhook.function_name}"
   retention_in_days = 14
