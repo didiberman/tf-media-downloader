@@ -138,8 +138,26 @@ async function handleAdminCommands(chatId, text, senderUsername) {
         const reqs = item.conversations?.N || 0;
         const allowed = item.is_allowed?.BOOL ? '✅' : '🚫';
 
+        // Get platform usage breakdown
+        const platformUsage = item.platform_usage?.M || {};
+        let platformBreakdown = '';
+
+        const ytLong = parseFloat(platformUsage['youtube-long']?.N || 0);
+        const ytShort = parseFloat(platformUsage['youtube-short']?.N || 0);
+        const igReel = parseFloat(platformUsage['instagram-reel']?.N || 0);
+        const igStory = parseFloat(platformUsage['instagram-story']?.N || 0);
+
+        const ytTotal = ytLong + ytShort;
+        const igTotal = igReel + igStory;
+
+        if (ytTotal > 0 || igTotal > 0) {
+          platformBreakdown = `   🎥 YT: ${ytTotal.toFixed(1)} MB | 📸 IG: ${igTotal.toFixed(1)} MB\n`;
+        }
+
         statsMsg += `${allowed} <b>@${user}</b>\n`;
-        statsMsg += `   💾 ${mb} MB | 🔄 ${reqs} reqs\n\n`;
+        statsMsg += `   💾 ${mb} MB | 🔄 ${reqs} reqs\n`;
+        statsMsg += platformBreakdown;
+        statsMsg += '\n';
       }
 
       await sendTelegramMessage(chatId, statsMsg);
@@ -289,33 +307,23 @@ async function handleAdminCommands(chatId, text, senderUsername) {
     return true;
   }
 
-  // CLEAR COMMAND
+  // CLEAR COMMAND - Only clears files, preserves user stats
   if (command === '/clear') {
     try {
-      await sendTelegramMessage(chatId, '⚠️ Clearing database and files... This may take a moment.');
+      await sendTelegramMessage(chatId, '⚠️ Clearing downloaded files... This may take a moment.');
 
-      // 1. Scan and delete all Users
-      const userScan = await ddb.send(new ScanCommand({ TableName: DYNAMODB_TABLE_NAME }));
-      for (const item of userScan.Items || []) {
-        await ddb.send(new DeleteItemCommand({
-          TableName: DYNAMODB_TABLE_NAME,
-          Key: { username: item.username }
-        }));
-      }
-
-      // 2. Scan and delete all Files records
+      // Only delete files records (preserves user stats)
       const fileScan = await ddb.send(new ScanCommand({ TableName: DYNAMODB_FILES_TABLE }));
+      let deletedCount = 0;
       for (const item of fileScan.Items || []) {
         await ddb.send(new DeleteItemCommand({
           TableName: DYNAMODB_FILES_TABLE,
           Key: { file_key: item.file_key }
         }));
+        deletedCount++;
       }
 
-      // Re-add Admin
-      await ensureUserExists(TELEGRAM_ADMIN_USERNAME, true, 'admin');
-
-      await sendTelegramMessage(chatId, '✅ Database cleared! Admin user restored.');
+      await sendTelegramMessage(chatId, `✅ Cleared ${deletedCount} file records! User stats preserved.`);
 
     } catch (error) {
       console.error(error);
