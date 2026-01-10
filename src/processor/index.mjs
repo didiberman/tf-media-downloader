@@ -592,7 +592,7 @@ export async function handler(event) {
             const outputType = sourceType === 'youtube-long' ? '🎵 MP3' : '🎬 MP4';
 
             const caption = `✅ <b>Download Complete!</b>\n\n` +
-                `<b>${title}</b>\n` +
+                `<b>${title}</b> (${fileSizeMB.toFixed(1)} MB)\n` +
                 `${outputType} ready:\n` +
                 `<a href="${s3Url}">📥 Direct S3 Link</a>\n\n` +
                 `<i>Link expires in 7 days</i>`;
