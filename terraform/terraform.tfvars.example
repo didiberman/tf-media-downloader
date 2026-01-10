@@ -1,0 +1,13 @@
+# Example Terraform variables
+# Copy this file to terraform.tfvars and fill in your values
+
+telegram_bot_token = "YOUR_BOT_TOKEN_FROM_BOTFATHER"
+s3_bucket_name     = "your-unique-media-bucket-name"
+aws_region         = "us-east-1"
+
+# Optional: Instagram cookies for authenticated downloads
+# Get these from your browser using "Get cookies.txt" extension
+# instagram_cookies = <<EOF
+# # Netscape HTTP Cookie File
+# .instagram.com	TRUE	/	TRUE	1234567890	sessionid	ABC123...
+# EOF
