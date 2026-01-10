@@ -84,7 +84,11 @@ async function editTelegramMessage(chatId, messageId, text) {
                 disable_web_page_preview: true,
             }),
         });
-        return response.json();
+        const result = await response.json();
+        if (!response.ok) {
+            console.warn('Telegram edit failed:', JSON.stringify(result));
+        }
+        return result;
     } catch (error) {
         console.error('Failed to edit Telegram message:', error.message);
         return null;
@@ -214,8 +218,10 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
     const args = buildYtdlpArgs(sourceType, url, outputTemplate, cookiesPath);
 
     // Add progress template for JSON output (both download and postprocess phases)
-    args.push('--progress-template', 'download:{"percent":"%(progress._percent_str)s","speed":"%(progress._speed_str)s","phase":"download"}');
-    args.push('--progress-template', 'postprocess:{"phase":"postprocess"}');
+    // IMPORTANT: 'download:' and 'postprocess:' are phase selectors, not prefixes in the output.
+    // We add 'JSON_PROGRESS:' as our own prefix to the template.
+    args.push('--progress-template', 'download:JSON_PROGRESS:{"percent":"%(progress._percent_str)s","speed":"%(progress._speed_str)s","phase":"download"}');
+    args.push('--progress-template', 'postprocess:JSON_PROGRESS:{"phase":"postprocess"}');
     args.push('--newline'); // Ensure each progress update is on a new line
 
     console.log('Running yt-dlp with args:', args);
@@ -235,8 +241,8 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
             },
         });
 
-        let lastUpdateTime = Date.now(); // Start with current time to allow first update quickly
-        const UPDATE_INTERVAL = 5000; // 5 seconds
+        let lastUpdateTime = 0; // Start at 0 so first update happens immediately
+        const UPDATE_INTERVAL = 2000; // 2 seconds for more responsive feedback
         let stderr = '';
 
         proc.stdout.on('data', async (data) => {
@@ -249,8 +255,8 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
                 let percent = null;
                 let speed = null;
 
-                // Try JSON template format: download:{"percent":"45.2%","speed":"2.5MiB/s","phase":"download"}
-                if (line.startsWith('download:') || line.startsWith('postprocess:')) {
+                // Try JSON template format: JSON_PROGRESS:{"percent":"45.2%","speed":"2.5MiB/s","phase":"download"}
+                if (line.includes('JSON_PROGRESS:')) {
                     try {
                         const jsonStart = line.indexOf('{');
                         const json = JSON.parse(line.substring(jsonStart));
@@ -258,19 +264,20 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
                         if (json.phase === 'postprocess') {
                             // Show converting message for postprocess phase
                             const now = Date.now();
-                            if (now - lastUpdateTime >= UPDATE_INTERVAL) {
-                                lastUpdateTime = now;
-                                await updateActiveDownload(downloadId, 'converting', '');
-                                if (chatId && progressMessageId) {
-                                    await editTelegramMessage(chatId, progressMessageId, `🎵 Converting to MP3...\n\n<i>Almost done...</i>`);
-                                }
+                            // Bypass throttle for phase change to ensure it's shown
+                            console.log('Phase change detected: postprocess');
+                            lastUpdateTime = now;
+                            await updateActiveDownload(downloadId, 'converting', '');
+                            if (chatId && progressMessageId) {
+                                console.log(`Editing message for postprocess: ${progressMessageId}`);
+                                await editTelegramMessage(chatId, progressMessageId, `🎵 Converting to MP3...\n\n<i>Almost done...</i>`);
                             }
                         } else {
                             percent = json.percent;
                             speed = json.speed;
                         }
                     } catch (e) {
-                        // Ignore parse errors
+                        console.error('Error parsing progress JSON:', e.message, line);
                     }
                 }
 
@@ -285,8 +292,9 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
 
                 if (percent) {
                     const now = Date.now();
-                    // Throttle DynamoDB updates to every 5 seconds
+                    // Throttle updates
                     if (now - lastUpdateTime >= UPDATE_INTERVAL) {
+                        console.log(`Triggering progress update: ${percent} (${speed})`);
                         lastUpdateTime = now;
                         await updateActiveDownload(downloadId, percent, speed);
 
@@ -314,26 +322,28 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
                 let speed = null;
 
                 // Try JSON template format
-                if (line.startsWith('download:') || line.startsWith('postprocess:')) {
+                // Try JSON template format
+                if (line.includes('JSON_PROGRESS:')) {
                     try {
                         const jsonStart = line.indexOf('{');
                         const json = JSON.parse(line.substring(jsonStart));
 
                         if (json.phase === 'postprocess') {
                             const now = Date.now();
-                            if (now - lastUpdateTime >= UPDATE_INTERVAL) {
-                                lastUpdateTime = now;
-                                await updateActiveDownload(downloadId, 'converting', '');
-                                if (chatId && progressMessageId) {
-                                    await editTelegramMessage(chatId, progressMessageId, `🎵 Converting to MP3...\n\n<i>Almost done...</i>`);
-                                }
+                            // Bypass throttle for phase change
+                            console.log('Phase change detected in stderr: postprocess');
+                            lastUpdateTime = now;
+                            await updateActiveDownload(downloadId, 'converting', '');
+                            if (chatId && progressMessageId) {
+                                console.log(`Editing message for postprocess (stderr): ${progressMessageId}`);
+                                await editTelegramMessage(chatId, progressMessageId, `🎵 Converting to MP3...\n\n<i>Almost done...</i>`);
                             }
                         } else {
                             percent = json.percent;
                             speed = json.speed;
                         }
                     } catch (e) {
-                        // Ignore parse errors
+                        console.error('Error parsing stderr progress JSON:', e.message, line);
                     }
                 }
 
@@ -349,6 +359,7 @@ async function downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, p
                 if (percent) {
                     const now = Date.now();
                     if (now - lastUpdateTime >= UPDATE_INTERVAL) {
+                        console.log(`Triggering stderr progress update: ${percent} (${speed})`);
                         lastUpdateTime = now;
                         await updateActiveDownload(downloadId, percent, speed);
 
