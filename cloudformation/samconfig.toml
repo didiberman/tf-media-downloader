@@ -1,0 +1,17 @@
+# SAM CLI Configuration File
+# This file is used by 'sam deploy' to store deployment parameters
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "media-downloader-bot"
+resolve_s3 = true
+s3_prefix = "media-downloader-bot"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+parameter_overrides = "TelegramBotToken=\"YOUR_BOT_TOKEN\" TelegramAdminUsername=\"your_username\" TelegramWebhookSecret=\"YOUR_SECRET\" S3BucketName=\"your-bucket-name\" ScrapecreatorsApiKey=\"YOUR_API_KEY\" OpenRouterApiKey=\"YOUR_API_KEY\""
+disable_rollback = false
+
+[default.build.parameters]
+use_container = true

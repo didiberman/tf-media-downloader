@@ -1,0 +1,46 @@
+# Example parameters file for CloudFormation deployment
+# Copy this file to parameters.json and fill in your values
+# These are used when deploying directly with AWS CLI (not SAM)
+
+[
+    {
+        "ParameterKey": "TelegramBotToken",
+        "ParameterValue": "YOUR_BOT_TOKEN_FROM_BOTFATHER"
+    },
+    {
+        "ParameterKey": "TelegramAdminUsername",
+        "ParameterValue": "your_telegram_username"
+    },
+    {
+        "ParameterKey": "TelegramWebhookSecret",
+        "ParameterValue": "YOUR_RANDOM_SECRET_STRING"
+    },
+    {
+        "ParameterKey": "S3BucketName",
+        "ParameterValue": "your-unique-media-bucket-name"
+    },
+    {
+        "ParameterKey": "AwsRegion",
+        "ParameterValue": "us-east-1"
+    },
+    {
+        "ParameterKey": "ScrapecreatorsApiKey",
+        "ParameterValue": "YOUR_SCRAPECREATORS_API_KEY"
+    },
+    {
+        "ParameterKey": "OpenRouterApiKey",
+        "ParameterValue": "YOUR_OPENROUTER_API_KEY"
+    },
+    {
+        "ParameterKey": "InstagramCookies",
+        "ParameterValue": "# No cookies configured"
+    },
+    {
+        "ParameterKey": "YouTubeCookies",
+        "ParameterValue": "# No cookies configured"
+    },
+    {
+        "ParameterKey": "YouTubeProxy",
+        "ParameterValue": ""
+    }
+]

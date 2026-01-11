@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Media Downloader Telegram Bot - CloudFormation/SAM Template
+
+# ============================================================================
+# PARAMETERS (equivalent to Terraform variables.tf)
+# ============================================================================
+Parameters:
+  AwsRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region to deploy resources
+
+  TelegramBotToken:
+    Type: String
+    NoEcho: true
+    Description: Telegram Bot API token from BotFather
+
+  ScrapecreatorsApiKey:
+    Type: String
+    NoEcho: true
+    Description: API Key for ScrapeCreators
+
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket for storing downloaded media
+
+  InstagramCookies:
+    Type: String
+    Default: "# No cookies configured"
+    NoEcho: true
+    Description: Instagram cookies.txt content for authenticated downloads (optional)
+
+  YouTubeCookies:
+    Type: String
+    Default: "# No cookies configured"
+    NoEcho: true
+    Description: YouTube cookies.txt content for authenticated downloads (optional)
+
+  YouTubeProxy:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Proxy URL for YouTube downloads
+
+  TelegramAdminUsername:
+    Type: String
+    Description: Telegram username of the bot admin (without @)
+
+  TelegramWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: Secret token for Telegram webhook authentication
+
+  OpenRouterApiKey:
+    Type: String
+    NoEcho: true
+    Description: OpenRouter API key for Gemini/Claude video analysis
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Tags:
+      Project: media-downloader-bot
+      ManagedBy: cloudformation
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+Resources:
+
+  # --------------------------------------------------------------------------
+  # S3 BUCKET (equivalent to s3.tf)
+  # --------------------------------------------------------------------------
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-after-7-days
+            Status: Enabled
+            Prefix: downloads/
+            ExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: media-downloader
+
+  # --------------------------------------------------------------------------
+  # SQS QUEUES (equivalent to sqs.tf)
+  # --------------------------------------------------------------------------
+  DownloadQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: media-download-queue
+      VisibilityTimeout: 900  # 15 minutes (matches Lambda timeout)
+      MessageRetentionPeriod: 86400  # 1 day
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DownloadDLQ.Arn
+        maxReceiveCount: 3
+
+  DownloadDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: media-download-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # --------------------------------------------------------------------------
+  # DYNAMODB TABLES (equivalent to dynamodb.tf)
+  # --------------------------------------------------------------------------
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: media-downloader-users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: username
+          AttributeType: S
+      KeySchema:
+        - AttributeName: username
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: media-downloader
+
+  FilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: media-downloader-files
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: file_key
+          AttributeType: S
+        - AttributeName: source_type
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: file_key
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: SourceTypeIndex
+          KeySchema:
+            - AttributeName: source_type
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: media-downloader
+
+  ActiveDownloadsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: media-downloader-active-downloads
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: download_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: download_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: media-downloader
+
+  # --------------------------------------------------------------------------
+  # SECRETS MANAGER (equivalent to iam.tf secrets)
+  # --------------------------------------------------------------------------
+  InstagramCookiesSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: media-downloader/instagram-cookies
+      SecretString: !Ref InstagramCookies
+
+  YouTubeCookiesSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: media-downloader/youtube-cookies
+      SecretString: !Ref YouTubeCookies
+
+  # --------------------------------------------------------------------------
+  # LAMBDA LAYER (equivalent to lambda-processor.tf layer)
+  # --------------------------------------------------------------------------
+  YtDlpLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: yt-dlp-ffmpeg
+      Description: yt-dlp and ffmpeg binaries for media downloading
+      CompatibleRuntimes:
+        - nodejs22.x
+      Content:
+        S3Bucket: !Ref MediaBucket
+        S3Key: layers/yt-dlp-ffmpeg.zip
+
+  # --------------------------------------------------------------------------
+  # WEBHOOK LAMBDA (equivalent to lambda-webhook.tf)
+  # --------------------------------------------------------------------------
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: media-downloader-webhook
+      Handler: index.handler
+      CodeUri: ../src/webhook/
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt WebhookLambdaRole.Arn
+      Environment:
+        Variables:
+          SQS_QUEUE_URL: !Ref DownloadQueue
+          TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
+          DYNAMODB_TABLE_NAME: !Ref UsersTable
+          DYNAMODB_FILES_TABLE: !Ref FilesTable
+          DYNAMODB_ACTIVE_DOWNLOADS_TABLE: !Ref ActiveDownloadsTable
+          TELEGRAM_ADMIN_USERNAME: !Ref TelegramAdminUsername
+          TELEGRAM_WEBHOOK_SECRET: !Ref TelegramWebhookSecret
+
+  WebhookFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt WebhookFunction.Arn
+
+  WebhookFunctionUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookFunction
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${WebhookFunction}
+      RetentionInDays: 14
+
+  # --------------------------------------------------------------------------
+  # PROCESSOR LAMBDA (equivalent to lambda-processor.tf)
+  # --------------------------------------------------------------------------
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: media-downloader-processor
+      Handler: index.handler
+      CodeUri: ../src/processor/
+      Timeout: 900  # 15 minutes for large downloads
+      MemorySize: 1536  # Increased for video analysis
+      EphemeralStorage:
+        Size: 2048  # 2GB temp storage for videos
+      Role: !GetAtt ProcessorLambdaRole.Arn
+      Layers:
+        - !Ref YtDlpLayer
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref MediaBucket
+          TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
+          INSTAGRAM_COOKIES_SECRET: !Ref InstagramCookiesSecret
+          YOUTUBE_COOKIES_SECRET: !Ref YouTubeCookiesSecret
+          YOUTUBE_PROXY: !Ref YouTubeProxy
+          DYNAMODB_TABLE_NAME: !Ref UsersTable
+          DYNAMODB_FILES_TABLE: !Ref FilesTable
+          DYNAMODB_ACTIVE_DOWNLOADS_TABLE: !Ref ActiveDownloadsTable
+          OPENROUTER_API_KEY: !Ref OpenRouterApiKey
+          SCRAPECREATORS_API_KEY: !Ref ScrapecreatorsApiKey
+          AWS_REGION_OVERRIDE: !Ref AwsRegion
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DownloadQueue.Arn
+            BatchSize: 1
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProcessorFunction}
+      RetentionInDays: 14
+
+  # --------------------------------------------------------------------------
+  # IAM ROLES (equivalent to iam.tf)
+  # --------------------------------------------------------------------------
+  WebhookLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: media-downloader-webhook-role-v2
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: webhook-lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DownloadQueue.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !GetAtt FilesTable.Arn
+                  - !Sub ${FilesTable.Arn}/index/*
+                  - !GetAtt ActiveDownloadsTable.Arn
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+
+  ProcessorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: media-downloader-processor-role-v2
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: processor-lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt DownloadQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub ${MediaBucket.Arn}/*
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt MediaBucket.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref InstagramCookiesSecret
+                  - !Ref YouTubeCookiesSecret
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt UsersTable.Arn
+                  - !GetAtt FilesTable.Arn
+                  - !Sub ${FilesTable.Arn}/index/*
+                  - !GetAtt ActiveDownloadsTable.Arn
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - transcribe:StartTranscriptionJob
+                  - transcribe:GetTranscriptionJob
+                Resource: "*"
+
+# ============================================================================
+# OUTPUTS (equivalent to outputs.tf)
+# ============================================================================
+Outputs:
+  WebhookUrl:
+    Description: Lambda Function URL for Telegram webhook
+    Value: !GetAtt WebhookFunctionUrl.FunctionUrl
+
+  S3BucketNameOutput:
+    Description: S3 bucket name for downloaded media
+    Value: !Ref MediaBucket
+
+  SetWebhookCommand:
+    Description: Command to set Telegram webhook (run manually - contains sensitive token)
+    Value: !Sub |
+      curl -X POST 'https://api.telegram.org/bot${TelegramBotToken}/setWebhook?url=${WebhookFunctionUrl.FunctionUrl}&secret_token=${TelegramWebhookSecret}'
