@@ -16,3 +16,5 @@ analyze_openrouter.py
 analyze_video.py
 analyze_video_complete.py
 lastone_ANALYSIS.txt
+/node_modules
+/src/processor/node_modules

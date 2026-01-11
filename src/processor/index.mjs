@@ -4,9 +4,13 @@ import { stat } from 'fs/promises';
 import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { downloadInstagramReel } from './instagram.mjs';
 import { DynamoDBClient, UpdateItemCommand, PutItemCommand, GetItemCommand, DeleteItemCommand } from '@aws-sdk/client-dynamodb';
 import { randomUUID } from 'crypto';
 import { analyzeVideo } from './videoAnalysis.mjs';
+import { ScanCommand } from '@aws-sdk/client-dynamodb';
+import { pipeline } from 'stream/promises';
+import { createWriteStream } from 'fs';
 
 const s3 = new S3Client({});
 const secrets = new SecretsManagerClient({});
@@ -163,7 +167,8 @@ function buildYtdlpArgs(sourceType, url, outputPath, cookiesPath) {
     const args = [];
 
     // Add proxy if configured
-    if (sourceType.startsWith('youtube') && YOUTUBE_PROXY) {
+    // Add proxy if configured
+    if ((sourceType.startsWith('youtube') || sourceType.startsWith('instagram')) && YOUTUBE_PROXY) {
         args.push('--proxy', YOUTUBE_PROXY);
     }
 
@@ -549,7 +554,7 @@ async function updateUsage(username, platform, sizeMB) {
     }
 }
 
-async function trackFile(key, sourceType, title, sizeMB, url, username) {
+async function trackFile(key, sourceType, title, sizeMB, url, username, downloadId) {
     if (!DYNAMODB_FILES_TABLE) return;
 
     try {
@@ -564,13 +569,14 @@ async function trackFile(key, sourceType, title, sizeMB, url, username) {
                 title: { S: title },
                 url: { S: url },
                 username: { S: username || 'unknown' },
+                download_id: { S: downloadId },
                 size_mb: { N: sizeMB.toFixed(2) },
                 created_at: { S: new Date().toISOString() },
                 ttl: { N: String(ttlSeconds) }
             },
             ConditionExpression: 'attribute_not_exists(file_key)'
         }));
-        console.log(`Tracked file: ${title}`);
+        console.log(`Tracked file: ${title} (ID: ${downloadId})`);
     } catch (error) {
         if (error.name !== 'ConditionalCheckFailedException') {
             console.error('Failed to track file:', error);
@@ -578,8 +584,24 @@ async function trackFile(key, sourceType, title, sizeMB, url, username) {
     }
 }
 
-async function handleAnalysisRequest(chatId, fileKey, username) {
+async function handleAnalysisRequest(chatId, downloadId, username) {
     try {
+        // Look up the file info from the files table using downloadId
+        const filesResult = await ddb.send(new ScanCommand({
+            TableName: DYNAMODB_FILES_TABLE,
+            FilterExpression: 'download_id = :downloadId',
+            ExpressionAttributeValues: {
+                ':downloadId': { S: downloadId }
+            }
+        }));
+
+        if (!filesResult.Items || filesResult.Items.length === 0) {
+            throw new Error(`File not found for downloadId: ${downloadId}. Note: Analysis only works for videos downloaded after this update.`);
+        }
+
+        const fileKey = filesResult.Items[0].file_key.S;
+        console.log(`Found file for analysis: ${fileKey}`);
+
         // Download file from S3 to /tmp
         const videoPath = `/tmp/${Date.now()}_video.mp4`;
         const videoStream = await s3.send(new GetObjectCommand({
@@ -588,18 +610,50 @@ async function handleAnalysisRequest(chatId, fileKey, username) {
         }));
 
         // Write stream to file
-        const fileStream = require('fs').createWriteStream(videoPath);
-        await require('stream/promises').pipeline(videoStream.Body, fileStream);
+        const fileStream = createWriteStream(videoPath);
+        await pipeline(videoStream.Body, fileStream);
 
         // Extract title from fileKey
         const filename = fileKey.split('/').pop();
         const title = filename.replace(/\.[^/.]+$/, '');
 
-        // Run analysis
-        const analysis = await analyzeVideo(videoPath, title);
+        // Initialize status tracking
+        const statusLines = ['🧠 *Deep Surveying Video...*', ''];
+
+        // Helper to update Telegram message
+        const updateProgress = async (newStatus) => {
+            // If status starts with a checkmark, it means a previous step completed
+            // If it starts with a spinner (🔄), it's the current step
+            // We want to transform the previous spinner into a checkmark if appropriate, 
+            // but for simplicity, we'll just append lines or update the last line.
+
+            // Refined Logic:
+            // 1. If we have a previous "current step" (detected by spinner), change it to checkmark if the new step implies completion.
+            //    Actually, the callback logic in videoAnalysis sends '✅ Step Done' explicitly.
+
+            // So we simply add the line to our list and edit the message.
+            // To avoid message spam, we might want to debounce, but since steps are slow, it's fine.
+
+            statusLines.push(newStatus);
+            await editTelegramMessage(chatId, messageId, statusLines.join('\n'));
+        };
+
+        // Send initial status message
+        const initialMsg = await sendTelegramMessage(chatId, '🧠 *Deep Surveying Video...*\n\n🔄 Initializing...');
+        const messageId = initialMsg.result.message_id;
+
+        // Run analysis with progress callback
+        const analysis = await analyzeVideo(videoPath, title, updateProgress);
 
         // Cleanup
         if (existsSync(videoPath)) unlinkSync(videoPath);
+
+        // Delete progress message
+        await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: chatId, message_id: messageId })
+        });
 
         // Send analysis to user (split if too long for Telegram)
         await sendAnalysisToTelegram(chatId, analysis, title);
@@ -658,8 +712,8 @@ export async function handler(event) {
 
         // Check if this is an analysis request
         if (messageBody.action === 'analyze') {
-            const { chatId, fileKey, username } = messageBody;
-            await handleAnalysisRequest(chatId, fileKey, username);
+            const { chatId, downloadId, username } = messageBody;
+            await handleAnalysisRequest(chatId, downloadId, username);
             continue;
         }
 
@@ -671,8 +725,26 @@ export async function handler(event) {
             // Get cookies if available
             const cookiesPath = await getCookiesForSource(sourceType);
 
-            // Download with yt-dlp (pass downloadId, chatId, progressMessageId for progress tracking)
-            filePath = await downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, progressMessageId);
+            // Download Logic Branch
+            if (sourceType.startsWith('instagram')) {
+                // Use ScrapeCreators for Instagram
+                if (chatId && progressMessageId) {
+                    await editTelegramMessage(chatId, progressMessageId, `📸 <b>Fetching from Instagram (ScrapeCreators)...</b>\n\n<i>This may take a moment...</i>`);
+                }
+
+                // Use downloadId as filename to ensure uniqueness and simple handling
+                const tempPath = `/tmp/${downloadId}.mp4`;
+                console.log(`Using ScrapeCreators to download to: ${tempPath}`);
+
+                const meta = await downloadInstagramReel(url, tempPath);
+                filePath = tempPath;
+
+                // Optional: You could allow the Apify meta title to override the filename-based title logic later if desired.
+                // For now, we stick to the file path.
+            } else {
+                // Download with yt-dlp (pass downloadId, chatId, progressMessageId for progress tracking)
+                filePath = await downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, progressMessageId);
+            }
             const stats = await stat(filePath);
             const fileSizeMB = stats.size / (1024 * 1024);
 
@@ -687,7 +759,7 @@ export async function handler(event) {
             const title = filename.replace(/\.[^/.]+$/, ""); // Simple title extraction from filename
 
             // Track File in DB
-            await trackFile(s3Key, sourceType, title, fileSizeMB, url, username);
+            await trackFile(s3Key, sourceType, title, fileSizeMB, url, username, downloadId);
 
             // Update user usage stats
             await updateUsage(username, sourceType, fileSizeMB);
@@ -701,12 +773,12 @@ export async function handler(event) {
                 `<i>Link expires in 7 days</i>`;
 
             // Create inline button for video analysis
-            // Only add button for short-form videos (< 90 seconds)
+            // Use downloadId as the callback data (short and unique)
             const analyzeButton = {
                 inline_keyboard: [[
                     {
                         text: "🧠 Analyze Video",
-                        callback_data: `analyze:${s3Key}`
+                        callback_data: `analyze:${downloadId}`
                     }
                 ]]
             };

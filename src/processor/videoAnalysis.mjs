@@ -1,9 +1,10 @@
 import { spawn } from 'child_process';
-import { writeFileSync, unlinkSync, existsSync, mkdirSync, readdirSync } from 'fs';
-import { S3Client, GetObjectCommand, PutObjectCommand } from '@aws-sdk/client-s3';
+import { writeFileSync, unlinkSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, createReadStream } from 'fs';
+import { S3Client, GetObjectCommand, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { TranscribeClient, StartTranscriptionJobCommand, GetTranscriptionJobCommand } from '@aws-sdk/client-transcribe';
 import { createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
+import { VISUAL_ANALYSIS_PROMPT, getSynthesisPrompt } from './prompts.mjs';
 
 const s3 = new S3Client({});
 const transcribe = new TranscribeClient({});
@@ -120,11 +121,11 @@ async function extractAudio(videoPath, outputPath) {
 /**
  * Transcribe audio using AWS Transcribe
  */
-async function transcribeAudio(audioPath, videoName) {
+async function transcribeAudio(audioPath, videoName, onProgress) {
     const s3Key = `temp/transcribe/${videoName}_${Date.now()}.wav`;
 
     // Upload audio to S3
-    const fileStream = require('fs').createReadStream(audioPath);
+    const fileStream = createReadStream(audioPath);
     await s3.send(new PutObjectCommand({
         Bucket: S3_BUCKET_NAME,
         Key: s3Key,
@@ -144,6 +145,8 @@ async function transcribeAudio(audioPath, videoName) {
         LanguageCode: 'en-US'
     }));
 
+    if (onProgress) await onProgress('✅ Audio Uploaded via S3');
+
     // Poll for completion
     while (true) {
         const status = await transcribe.send(new GetTranscriptionJobCommand({
@@ -159,7 +162,7 @@ async function transcribeAudio(audioPath, videoName) {
             const transcript = data.results.transcripts[0].transcript;
 
             // Cleanup S3
-            await s3.send(new require('@aws-sdk/client-s3').DeleteObjectCommand({
+            await s3.send(new DeleteObjectCommand({
                 Bucket: S3_BUCKET_NAME,
                 Key: s3Key
             }));
@@ -177,23 +180,12 @@ async function transcribeAudio(audioPath, videoName) {
  * Analyze video frames with Gemini 2.5 Flash Image
  */
 async function analyzeVisuals(frames) {
-    const { readFileSync } = require('fs');
 
     console.log(`Analyzing ${frames.length} frames with Gemini...`);
 
     const content = [{
         type: "text",
-        text: `You are a world-class viral video strategist analyzing a short-form video.
-
-Focus ONLY on VISUAL elements (audio analyzed separately):
-
-1. **The Hook (0-3s)**: What visual elements stop the scroll?
-2. **Visual Pacing & Editing**: Cut frequency, transitions, scene variety
-3. **Camera Work & Production**: Angles, lighting, composition
-4. **Visual Hooks Throughout**: Text overlays, graphics, effects
-5. **Retention Mechanics**: Visual payoff structure, curiosity gaps
-
-Be specific, actionable, and sophisticated.`
+        text: VISUAL_ANALYSIS_PROMPT
     }];
 
     // Add frames as base64
@@ -219,11 +211,27 @@ Be specific, actionable, and sophisticated.`
         })
     });
 
+    // Get raw response text first for debugging
+    const responseText = await response.text();
+    console.log(`Gemini API response status: ${response.status}`);
+    console.log(`Gemini API response (first 500 chars): ${responseText.substring(0, 500)}`);
+
     if (!response.ok) {
-        throw new Error(`Gemini API error: ${response.status}`);
+        throw new Error(`Gemini API error: ${response.status} - ${responseText}`);
     }
 
-    const result = await response.json();
+    // Parse JSON with error handling
+    let result;
+    try {
+        result = JSON.parse(responseText);
+    } catch (parseError) {
+        throw new Error(`Failed to parse Gemini response: ${parseError.message}. Response was: ${responseText.substring(0, 200)}`);
+    }
+
+    if (!result.choices || !result.choices[0] || !result.choices[0].message) {
+        throw new Error(`Unexpected Gemini response structure: ${JSON.stringify(result).substring(0, 200)}`);
+    }
+
     return result.choices[0].message.content;
 }
 
@@ -231,48 +239,7 @@ Be specific, actionable, and sophisticated.`
  * Synthesize analysis with Claude Sonnet 4.5
  */
 async function synthesizeAnalysis(visualAnalysis, transcript, duration, title) {
-    const prompt = `You are a world-class viral video strategist. You have TWO separate analyses of a ${Math.round(duration)}-second short-form video titled "${title}":
-
-━━━━━━━━━━━━━━━━━━━━━━
-📹 VISUAL ANALYSIS (Gemini 2.5 Flash Image):
-━━━━━━━━━━━━━━━━━━━━━━
-${visualAnalysis}
-
-━━━━━━━━━━━━━━━━━━━━━━
-🎙️ AUDIO TRANSCRIPT (AWS Transcribe):
-━━━━━━━━━━━━━━━━━━━━━━
-${transcript}
-
-━━━━━━━━━━━━━━━━━━━━━━
-
-Your task: Create a TELEGRAM-OPTIMIZED analysis (max 4000 chars) with this structure:
-
-📊 **VIDEO OVERVIEW**
-2-3 sentences about what this video is about.
-
-🎯 **THE HOOK (0-3s)**
-How audio + visuals work together to stop scrolling.
-
-⚡ **SUCCESS FACTORS** (Top 3)
-1. Factor name - why it works
-2. Factor name - why it works
-3. Factor name - why it works
-
-🔥 **VIRALITY MECHANICS**
-• Emotional arc
-• Retention loop
-• Shareability factor
-
-💡 **CONTENT REMIX IDEAS**
-1. [Niche]: Specific angle
-2. [Niche]: Specific angle
-3. [Niche]: Specific angle
-
-IMPORTANT:
-- Use emojis for scanability
-- Keep sections concise (Telegram has char limits)
-- Use bullet points, not long paragraphs
-- Bold key terms with *asterisks* for Telegram MarkdownV2`;
+    const prompt = getSynthesisPrompt(visualAnalysis, transcript, duration, title);
 
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
@@ -286,52 +253,86 @@ IMPORTANT:
         })
     });
 
+    // Get raw response text first for debugging
+    const responseText = await response.text();
+    console.log(`Claude API response status: ${response.status}`);
+    console.log(`Claude API response (first 500 chars): ${responseText.substring(0, 500)}`);
+
     if (!response.ok) {
-        throw new Error(`Claude API error: ${response.status}`);
+        throw new Error(`Claude API error: ${response.status} - ${responseText}`);
     }
 
-    const result = await response.json();
+    // Parse JSON with error handling
+    let result;
+    try {
+        result = JSON.parse(responseText);
+    } catch (parseError) {
+        throw new Error(`Failed to parse Claude response: ${parseError.message}. Response was: ${responseText.substring(0, 200)}`);
+    }
+
+    if (!result.choices || !result.choices[0] || !result.choices[0].message) {
+        throw new Error(`Unexpected Claude response structure: ${JSON.stringify(result).substring(0, 200)}`);
+    }
+
     return result.choices[0].message.content;
 }
 
 /**
  * Main analysis pipeline
  */
-export async function analyzeVideo(videoPath, title) {
+export async function analyzeVideo(videoPath, title, onProgress) {
     const duration = await getVideoDuration(videoPath);
     console.log(`Video duration: ${duration.toFixed(1)}s`);
+    if (onProgress) await onProgress('✅ Duration Analyzed');
 
-    // Extract frames
     const framesDir = `/tmp/frames_${Date.now()}`;
-    const frames = await extractFrames(videoPath, framesDir, duration);
-    console.log(`Extracted ${frames.length} frames`);
-
-    // Extract and transcribe audio
     const audioPath = `/tmp/audio_${Date.now()}.wav`;
-    let transcript = '[No audio detected]';
 
-    const hasAudio = await extractAudio(videoPath, audioPath);
-    if (hasAudio) {
-        try {
-            transcript = await transcribeAudio(audioPath, title.replace(/[^a-zA-Z0-9]/g, '_'));
-            console.log(`Transcript: ${transcript.substring(0, 100)}...`);
-        } catch (error) {
-            console.error('Transcription failed:', error);
+    // Define parallel tasks
+    const visualTask = async () => {
+        console.log('Starting visual task...');
+        const frames = await extractFrames(videoPath, framesDir, duration);
+        console.log(`Extracted ${frames.length} frames`);
+        if (onProgress) await onProgress('✅ Frames Extracted');
+
+        if (onProgress) await onProgress('🔄 Analyzing Visuals (Gemini)...');
+        const analysis = await analyzeVisuals(frames);
+        console.log('Visual analysis complete');
+        return analysis;
+    };
+
+    const audioTask = async () => {
+        console.log('Starting audio task...');
+        let transcript = '[No audio detected]';
+
+        const hasAudio = await extractAudio(videoPath, audioPath);
+        if (hasAudio) {
+            try {
+                if (onProgress) await onProgress('🔄 Transcribing Audio...');
+                transcript = await transcribeAudio(audioPath, title.replace(/[^a-zA-Z0-9]/g, '_'), onProgress);
+                console.log(`Transcript: ${transcript.substring(0, 100)}...`);
+                // Note: transcribeAudio calls onProgress('✅ Audio Transcribed') internally
+            } catch (error) {
+                console.error('Transcription failed:', error);
+            }
+            if (existsSync(audioPath)) unlinkSync(audioPath);
+        } else {
+            if (onProgress) await onProgress('⚠️ No Audio Detected');
         }
-        if (existsSync(audioPath)) unlinkSync(audioPath);
-    }
+        return transcript;
+    };
 
-    // Analyze visuals
-    const visualAnalysis = await analyzeVisuals(frames);
-    console.log('Visual analysis complete');
+    // Execute in parallel
+    const [visualAnalysis, transcript] = await Promise.all([visualTask(), audioTask()]);
 
     // Synthesize
+    if (onProgress) await onProgress('⬜ Synthesizing Strategy (Claude)...');
     const finalAnalysis = await synthesizeAnalysis(visualAnalysis, transcript, duration, title);
     console.log('Synthesis complete');
 
     // Cleanup
     if (existsSync(framesDir)) {
-        require('fs').rmSync(framesDir, { recursive: true, force: true });
+        rmSync(framesDir, { recursive: true, force: true });
     }
 
     return finalAnalysis;

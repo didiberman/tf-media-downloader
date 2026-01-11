@@ -399,9 +399,9 @@ export async function handler(event) {
         return { statusCode: 200, body: 'OK' };
       }
 
-      // Handle "analyze:fileKey" callback
+      // Handle "analyze:downloadId" callback
       if (callbackData.startsWith('analyze:')) {
-        const fileKey = callbackData.replace('analyze:', '');
+        const downloadId = callbackData.replace('analyze:', '');
 
         // Answer the callback query immediately
         await answerCallbackQuery(callbackQuery.id, '🧠 Starting analysis...');
@@ -416,7 +416,7 @@ export async function handler(event) {
             MessageBody: JSON.stringify({
               action: 'analyze',
               chatId,
-              fileKey,
+              downloadId,
               username,
             }),
           })

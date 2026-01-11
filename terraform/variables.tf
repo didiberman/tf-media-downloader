@@ -10,6 +10,12 @@ variable "telegram_bot_token" {
   sensitive   = true
 }
 
+variable "scrapecreators_api_key" {
+  description = "API Key for ScrapeCreators"
+  type        = string
+  sensitive   = true
+}
+
 variable "s3_bucket_name" {
   description = "Name of the S3 bucket for storing downloaded media"
   type        = string

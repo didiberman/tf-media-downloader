@@ -1,7 +1,7 @@
 resource "aws_dynamodb_table" "users" {
-  name           = "media-downloader-users"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "username"
+  name         = "media-downloader-users"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "username"
 
   attribute {
     name = "username"
@@ -14,9 +14,9 @@ resource "aws_dynamodb_table" "users" {
 }
 
 resource "aws_dynamodb_table" "files" {
-  name           = "media-downloader-files"
-  billing_mode   = "PAY_PER_REQUEST"
-  hash_key       = "file_key"
+  name         = "media-downloader-files"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "file_key"
 
   attribute {
     name = "file_key"

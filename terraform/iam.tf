@@ -112,13 +112,13 @@ resource "aws_iam_role_policy" "processor_lambda" {
         Resource = "${aws_s3_bucket.media.arn}/*"
       },
       {
-        Effect = "Allow"
-        Action = "s3:ListBucket"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
         Resource = aws_s3_bucket.media.arn
       },
       {
-        Effect   = "Allow"
-        Action   = "secretsmanager:GetSecretValue"
+        Effect = "Allow"
+        Action = "secretsmanager:GetSecretValue"
         Resource = [
           aws_secretsmanager_secret.instagram_cookies.arn,
           aws_secretsmanager_secret.youtube_cookies.arn

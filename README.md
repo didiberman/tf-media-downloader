@@ -1,6 +1,17 @@
-# Media Downloader Telegram Bot
+# Deep Video Strategist – Telegram Bot  
 
-A serverless Telegram bot that downloads media from Instagram and YouTube, stores it in S3 with automatic 7-day expiration, and manages user access via DynamoDB.
+A serverless Telegram bot that **downloads short-form videos** (Instagram Reels, YouTube Shorts) and **analyzes them with AI** to extract deep viral strategy insights. Powered by Gemini 2.5 Flash (visual analysis) and Claude Sonnet (strategic synthesis) via OpenRouter.
+
+---
+
+## What It Does
+
+1. **Download** – Send an Instagram Reel or YouTube Short link and get the MP4 delivered to your chat + stored in S3.  
+2. **Analyze** – Tap the "🧠 Analyze Video" button to receive a full strategic breakdown:
+   - Visual narrative & hook analysis (Gemini 2.5 Flash with frame extraction)  
+   - Audio transcript (AWS Transcribe)  
+   - Deep strategic synthesis (Claude Sonnet)  
+3. **Learn** – Get actionable insights on *why* the video works, the psychological hooks, virality mechanics, and a replication blueprint for your own content.
 
 ---
 
@@ -15,15 +26,44 @@ A serverless Telegram bot that downloads media from Instagram and YouTube, store
                                                            ▼
 ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
 │   S3 Bucket     │◀─────│ Processor Lambda│◀─────│  DynamoDB x3    │
-│ (7-day Lifecycle│      │ (yt-dlp + Send) │      │ (Users + Files  │
+│ (7-day Lifecycle│      │ (Download + AI) │      │ (Users + Files  │
 └─────────────────┘      └────────┬────────┘      │  + Active DLs)  │
                                   │               └─────────────────┘
                                   ▼
-                         ┌─────────────────┐
-                         │ Telegram Message│
-                         │ (Live Updates)  │
-                         └─────────────────┘
+                    ┌─────────────────────────┐
+                    │ AI Analysis Pipeline    │
+                    │ ┌─────────┐ ┌─────────┐ │
+                    │ │ Gemini  │ │Transcribe│ │
+                    │ │ (Visual)│ │ (Audio) │ │
+                    │ └────┬────┘ └────┬────┘ │
+                    │      └─────┬─────┘      │
+                    │      ┌─────▼─────┐      │
+                    │      │  Claude   │      │
+                    │      │(Synthesis)│      │
+                    │      └───────────┘      │
+                    └─────────────────────────┘
 ```
+
+---
+
+## AI Analysis Pipeline
+
+The "🧠 Analyze Video" feature runs a multi-model analysis:
+
+| Step | Model | Purpose |
+|------|-------|---------|
+| **Frame Extraction** | FFmpeg | Extract key frames (2fps hook, 1fps body) |
+| **Visual Analysis** | Gemini 2.5 Flash Image | Analyze hook, pacing, production, text overlays |
+| **Transcription** | AWS Transcribe | Convert audio to text |
+| **Synthesis** | Claude Sonnet | Combine analyses into strategic insights |
+
+**Output includes:**
+- 📊 What the video really is (core insight)
+- 🎯 Psychological hook analysis  
+- ⚡ Success factors (3 core principles)
+- 🔥 Virality mechanics breakdown
+- 💡 Replication blueprint
+- 🎬 Creator insights
 
 ---
 
@@ -32,13 +72,14 @@ A serverless Telegram bot that downloads media from Instagram and YouTube, store
 | Service | Purpose | Key Configuration |
 |---------|---------|-------------------|
 | **Lambda** (Webhook) | Receives Telegram webhooks, authenticates users, routes commands | Node.js 22, 256MB, 30s timeout |
-| **Lambda** (Processor) | Downloads media with yt-dlp, uploads to S3, sends to Telegram | Node.js 22, 1024MB, 900s timeout, Custom Lambda Layer |
+| **Lambda** (Processor) | Downloads media, runs AI analysis, sends to Telegram | Node.js 22, 1024MB, 900s timeout, Custom Lambda Layer |
 | **SQS** | Decouples webhook from processor, handles retry logic | 900s visibility timeout, DLQ after 3 attempts |
 | **DynamoDB** (`users`) | Stores user auth status, usage stats (total + per-platform) | PAY_PER_REQUEST, PK: `username` |
 | **DynamoDB** (`files`) | Indexes downloaded files for deduplication and listing | PAY_PER_REQUEST, PK: `file_key`, TTL enabled |
 | **DynamoDB** (`active_downloads`) | Tracks in-progress downloads for real-time status | PAY_PER_REQUEST, PK: `download_id`, TTL: 15min |
-| **S3** | Stores downloaded media files | 7-day lifecycle expiration on `downloads/` prefix |
-| **Secrets Manager** | Stores Instagram/YouTube cookies for authentication | Retrieved at runtime by Processor Lambda |
+| **S3** | Stores downloaded media files + temp audio for transcription | 7-day lifecycle expiration on `downloads/` prefix |
+| **Secrets Manager** | Stores Instagram/YouTube cookies & OpenRouter API key | Retrieved at runtime by Processor Lambda |
+| **AWS Transcribe** | Converts video audio to text for analysis | On-demand, en-US |
 | **IAM** | Least-privilege policies for each Lambda | Separate roles per function |
 
 ---
@@ -229,6 +270,7 @@ Telegram webhook requests are authenticated using a secret token:
 |----------|-------------|
 | `S3_BUCKET_NAME` | Bucket for media storage |
 | `TELEGRAM_BOT_TOKEN` | Bot token |
+| `OPENROUTER_API_KEY` | OpenRouter API key for Gemini/Claude access |
 | `INSTAGRAM_COOKIES_SECRET` | Secrets Manager ARN |
 | `YOUTUBE_COOKIES_SECRET` | Secrets Manager ARN |
 | `YOUTUBE_PROXY` | Proxy URL for YouTube (bypass IP blocks) |

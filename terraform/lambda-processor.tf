@@ -12,7 +12,7 @@ resource "aws_lambda_function" "processor" {
   handler          = "index.handler"
   runtime          = "nodejs22.x"
   role             = aws_iam_role.processor_lambda.arn
-  timeout          = 900 # 15 minutes for large downloads
+  timeout          = 900  # 15 minutes for large downloads
   memory_size      = 1536 # Increased for video analysis
   ephemeral_storage {
     size = 2048 # 2GB temp storage for videos
@@ -22,17 +22,18 @@ resource "aws_lambda_function" "processor" {
 
   environment {
     variables = {
-      S3_BUCKET_NAME           = aws_s3_bucket.media.id
-      TELEGRAM_BOT_TOKEN       = var.telegram_bot_token
-      INSTAGRAM_COOKIES_SECRET = aws_secretsmanager_secret.instagram_cookies.arn
-      YOUTUBE_COOKIES_SECRET   = aws_secretsmanager_secret.youtube_cookies.arn
-      YOUTUBE_PROXY            = var.youtube_proxy
-      DYNAMODB_TABLE_NAME      = aws_dynamodb_table.users.name
-      DYNAMODB_FILES_TABLE     = aws_dynamodb_table.files.name
+      S3_BUCKET_NAME                  = aws_s3_bucket.media.id
+      TELEGRAM_BOT_TOKEN              = var.telegram_bot_token
+      INSTAGRAM_COOKIES_SECRET        = aws_secretsmanager_secret.instagram_cookies.arn
+      YOUTUBE_COOKIES_SECRET          = aws_secretsmanager_secret.youtube_cookies.arn
+      YOUTUBE_PROXY                   = var.youtube_proxy
+      DYNAMODB_TABLE_NAME             = aws_dynamodb_table.users.name
+      DYNAMODB_FILES_TABLE            = aws_dynamodb_table.files.name
       DYNAMODB_ACTIVE_DOWNLOADS_TABLE = aws_dynamodb_table.active_downloads.name
-      OPENROUTER_API_KEY       = var.openrouter_api_key
+      OPENROUTER_API_KEY              = var.openrouter_api_key
+      SCRAPECREATORS_API_KEY          = var.scrapecreators_api_key
 
-      AWS_REGION_OVERRIDE      = var.aws_region
+      AWS_REGION_OVERRIDE = var.aws_region
     }
   }
 }
