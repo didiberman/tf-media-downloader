@@ -720,6 +720,7 @@ export async function handler(event) {
         // Otherwise, it's a download request
         const { chatId, url, sourceType, username, downloadId, progressMessageId } = messageBody;
         let filePath = null;
+        let metaTitle = null; // Store title from metadata for proper naming
 
         try {
             // Get cookies if available
@@ -732,17 +733,30 @@ export async function handler(event) {
                     await editTelegramMessage(chatId, progressMessageId, `📸 <b>Fetching from Instagram (ScrapeCreators)...</b>\n\n<i>This may take a moment...</i>`);
                 }
 
-                // Use downloadId as filename to ensure uniqueness and simple handling
-                const tempPath = `/tmp/${downloadId}.mp4`;
-                console.log(`Using ScrapeCreators to download to: ${tempPath}`);
+                // Download to temp path first
+                const tempDownloadPath = `/tmp/${downloadId}_temp.mp4`;
+                console.log(`Using ScrapeCreators to download to: ${tempDownloadPath}`);
 
-                const meta = await downloadInstagramReel(url, tempPath);
-                filePath = tempPath;
+                const meta = await downloadInstagramReel(url, tempDownloadPath);
 
-                // Optional: You could allow the Apify meta title to override the filename-based title logic later if desired.
-                // For now, we stick to the file path.
+                // Use caption as title, sanitize for filesystem
+                metaTitle = meta.title || `Instagram_${downloadId}`;
+                // Sanitize: remove special chars, limit length, replace spaces with underscores
+                const sanitizedTitle = metaTitle
+                    .replace(/[^\w\s\u0590-\u05FF\u0600-\u06FF-]/g, '') // Keep letters, numbers, spaces, Hebrew, Arabic, hyphens
+                    .replace(/\s+/g, '_')  // Replace spaces with underscores
+                    .substring(0, 100)     // Limit length
+                    .trim() || `Instagram_${downloadId}`;
+
+                // Rename file to use proper title
+                const finalPath = `/tmp/${sanitizedTitle} [${downloadId.substring(0, 8)}].mp4`;
+                renameSync(tempDownloadPath, finalPath);
+                filePath = finalPath;
+
+                console.log(`Renamed Instagram file to: ${filePath}`);
             } else {
                 // Download with yt-dlp (pass downloadId, chatId, progressMessageId for progress tracking)
+                // yt-dlp already names files with title via output template
                 filePath = await downloadMedia(sourceType, url, cookiesPath, downloadId, chatId, progressMessageId);
             }
             const stats = await stat(filePath);
