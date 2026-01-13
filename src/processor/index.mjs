@@ -618,7 +618,7 @@ async function handleAnalysisRequest(chatId, downloadId, username) {
         const title = filename.replace(/\.[^/.]+$/, '');
 
         // Initialize status tracking
-        const statusLines = ['🧠 *Deep Surveying Video...*', ''];
+        const statusLines = ['🧠 <b>Deep Surveying Video...</b>', ''];
 
         // Helper to update Telegram message
         const updateProgress = async (newStatus) => {
@@ -639,7 +639,7 @@ async function handleAnalysisRequest(chatId, downloadId, username) {
         };
 
         // Send initial status message
-        const initialMsg = await sendTelegramMessage(chatId, '🧠 *Deep Surveying Video...*\n\n🔄 Initializing...');
+        const initialMsg = await sendTelegramMessage(chatId, '🧠 <b>Deep Surveying Video...</b>\n\n🔄 Initializing...');
         const messageId = initialMsg.result.message_id;
 
         // Run analysis with progress callback
@@ -666,7 +666,12 @@ async function handleAnalysisRequest(chatId, downloadId, username) {
 
 async function sendAnalysisToTelegram(chatId, analysis, title) {
     const header = `🎬 <b>Video Analysis: ${title}</b>\n\n`;
-    const fullMessage = header + analysis;
+    // Convert Markdown bold to HTML bold in case the AI ignored instructions
+    const cleanAnalysis = analysis
+        .replace(/\*\*(.*?)\*\*/g, '<b>$1</b>') // **bold**
+        .replace(/(^|\n)\*\s/g, '$1• ');        // * bullet to • bullet (just in case)
+
+    const fullMessage = header + cleanAnalysis;
 
     // Telegram has a 4096 char limit per message
     if (fullMessage.length <= 4096) {

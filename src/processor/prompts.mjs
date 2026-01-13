@@ -38,7 +38,7 @@ Be vivid and descriptive so someone reading this can "see" the video.`;
  * @returns {string} The formatted prompt for Claude
  */
 export function getSynthesisPrompt(visualAnalysis, transcript, duration, title) {
-    return `You are a world-class viral video strategist. You have TWO separate analyses of a ${Math.round(duration)}-second short-form video titled "${title}":
+   return `You are a world-class viral video strategist. You have TWO separate analyses of a ${Math.round(duration)}-second short-form video titled "${title}":
 
 ━━━━━━━━━━━━━━━━━━━━━━
 📹 VISUAL ANALYSIS (Gemini 2.5 Flash Image):
@@ -85,5 +85,5 @@ IMPORTANT:
 - Use emojis for scanability
 - Keep sections concise (Telegram has char limits)
 - Use bullet points, not long paragraphs
-- Bold key terms with *asterisks* for Telegram MarkdownV2`;
+- Use HTML <b>tags</b> for bold text (DO NOT use asterisks like **bold** or *bold*)`;
 }

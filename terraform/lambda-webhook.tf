@@ -45,3 +45,20 @@ resource "aws_cloudwatch_log_group" "webhook" {
   name              = "/aws/lambda/${aws_lambda_function.webhook.function_name}"
   retention_in_days = 14
 }
+
+resource "null_resource" "telegram_webhook" {
+  triggers = {
+    telegram_bot_token      = var.telegram_bot_token
+    telegram_webhook_secret = var.telegram_webhook_secret
+    webhook_url             = aws_lambda_function_url.webhook.function_url
+  }
+
+  provisioner "local-exec" {
+    command = "curl -s -X POST https://api.telegram.org/bot${self.triggers.telegram_bot_token}/setWebhook -d url=${self.triggers.webhook_url} -d secret_token=${self.triggers.telegram_webhook_secret}"
+  }
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = "curl -s -X POST https://api.telegram.org/bot${self.triggers.telegram_bot_token}/deleteWebhook"
+  }
+}
